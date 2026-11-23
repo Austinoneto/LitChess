@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Check Contract Pending Entries</title>
+    <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+</head>
+<body>
+    <h1>Check Pending Entries on LitChessEscrow</h1>
+    <p>Contract Address: <strong>0x5d9949A436D07a3985e5f966D2f6e637A7963A80</strong></p>
+    <button id="connectBtn">Connect MetaMask</button>
+    <button id="checkBtn" disabled>Check Pending (0.01 zkLTC, Blitz)</button>
+    <pre id="result">Waiting for connection...</pre>
+
+    <script>
+        // Use the ABI you provided (only the getPendingMatches function is needed)
+        const ABI = [
+            {
+                "inputs": [
+                    { "internalType": "uint256", "name": "_stake", "type": "uint256" },
+                    { "internalType": "enum LitChessEscrowclean.TimeControl", "name": "_tc", "type": "uint8" }
+                ],
+                "name": "getPendingMatches",
+                "outputs": [
+                    {
+                        "components": [
+                            { "internalType": "address", "name": "player", "type": "address" },
+                            { "internalType": "uint256", "name": "stake", "type": "uint256" },
+                            { "internalType": "enum LitChessEscrowclean.TimeControl", "name": "tc", "type": "uint8" },
+                            { "internalType": "uint256", "name": "timestamp", "type": "uint256" },
+                            { "internalType": "enum LitChessEscrowclean.ColorPref", "name": "pref", "type": "uint8" }
+                        ],
+                        "internalType": "struct LitChessEscrowclean.PendingMatch[]",
+                        "name": "",
+                        "type": "tuple[]"
+                    }
+                ],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ];
+
+        const CONTRACT_ADDR = "0x5d9949A436D07a3985e5f966D2f6e637A7963A80";
+        let signer = null;
+        let contract = null;
+
+        document.getElementById('connectBtn').onclick = async () => {
+            if (!window.ethereum) {
+                document.getElementById('result').innerText = 'MetaMask not installed!';
+                return;
+            }
+            const provider = new ethers.providers.Web3Provider(window.ethereum);
+            await provider.send("eth_requestAccounts", []);
+            signer = provider.getSigner();
+            contract = new ethers.Contract(CONTRACT_ADDR, ABI, signer);
+            document.getElementById('connectBtn').disabled = true;
+            document.getElementById('checkBtn').disabled = false;
+            document.getElementById('result').innerText = 'Connected. Click "Check" to see pending entries.';
+        };
+
+        document.getElementById('checkBtn').onclick = async () => {
+            if (!contract) return;
+            const stakeWei = ethers.utils.parseEther("0.01");
+            const tc = 1; // Blitz
+            try {
+                const pending = await contract.getPendingMatches(stakeWei, tc);
+                document.getElementById('result').innerText = JSON.stringify(pending, null, 2);
+                if (pending.length === 0) {
+                    document.getElementById('result').innerHTML += '\n\n✅ Contract is fresh (no pending entries).';
+                } else {
+                    document.getElementById('result').innerHTML += `\n\n⚠️ Found ${pending.length} pending entries. Contract is NOT fresh.`;
+                }
+            } catch (err) {
+                document.getElementById('result').innerText = 'Error: ' + err.message;
+            }
+        };
+    </script>
+</body>
+</html>

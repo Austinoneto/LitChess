@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LitChess — Institutional Decentralized Chess Protocol</title>
+    <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- ====================== NON-BLOCKING TOAST CONTAINER ====================== -->
+    <div id="toast-container" aria-live="polite"></div>
+
+    <!-- ====================== ON-CHAIN USERNAME MODAL ====================== -->
+    <div id="username-modal" class="modal-backdrop hidden-element">
+        <div class="modal-card">
+            <h3>🛡️ Register On-Chain Identity</h3>
+            <p class="modal-subtitle">Claim your permanent handle on the LitVM Username Registry smart contract.</p>
+            <input type="text" id="username-modal-input" placeholder="e.g. satoshi_gm (max 20 chars)" maxlength="20">
+            <div class="modal-actions">
+                <button id="btn-username-skip" class="btn-secondary">Use Anon Handle</button>
+                <button id="btn-username-submit" class="btn-primary">Register On-Chain</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ====================== HOMEPAGE VIEW ====================== -->
+    <div id="home-view-container" class="hero">
+        <div class="landing-top-bar">
+            <div class="protocol-badge">
+                <span class="pulse-dot"></span> LITVM ZERO-TRUST ESCROW PROTOCOL
+            </div>
+            <div class="landing-wallet-anchor">
+                <button id="btn-connect-wallet-landing" class="btn-wallet-neon">🔗 CONNECT WALLET</button>
+            </div>
+        </div>
+
+        <div class="hero-content">
+            <div class="hero-brand-pill">⚡ LITFORGE HACKATHON EDITION</div>
+            <h1>LITCHESS</h1>
+            <p>Institutional-Grade • Wagered • Cryptographically Verified Chess Battles</p>
+            
+            <div class="game-mode-selectors">
+                <button class="btn-launch mode-btn" data-mode="solo">
+                    <span class="mode-icon">🤖</span>
+                    <strong>PLAY SOLO</strong>
+                    <small>Alpha-Beta PST Engine</small>
+                </button>
+                <button class="btn-launch mode-btn" data-mode="2p">
+                    <span class="mode-icon">⚔️</span>
+                    <strong>TWO PLAYERS</strong>
+                    <small>Wagered &amp; Free PvP</small>
+                </button>
+                <button class="btn-launch mode-btn" data-mode="tourney">
+                    <span class="mode-icon">🏆</span>
+                    <strong>TOURNAMENTS</strong>
+                    <small>Winner-Takes-All Arena</small>
+                </button>
+            </div>
+
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3 id="total-games">24,837</h3>
+                    <p>Total Games Settled</p>
+                </div>
+                <div class="stat-card">
+                    <h3 id="active-games">1</h3>
+                    <p>Live Battles Now</p>
+                </div>
+                <div class="stat-card">
+                    <h3 id="players-online">1</h3>
+                    <p>Connected Nodes</p>
+                </div>
+            </div>
+
+            <div class="global-search">
+                <input type="text" id="search-user-input-home" placeholder="🔎 Search player username or 0x wallet address...">
+                <button id="btn-search-user-home">Inspect</button>
+            </div>
+            <div id="search-result-display-home" class="hidden-element search-res-home">
+                <div class="search-user-meta">
+                    <strong id="found-username-home"></strong>
+                    <span id="found-ratings-home" class="search-rating-badges"></span>
+                </div>
+                <div class="search-user-actions">
+                    <button id="btn-spectate-user-home" class="btn-spectate-sm hidden-element">👁️ Spectate</button>
+                    <button id="btn-add-friend-home" class="btn-friend-add">+ Add Friend</button>
+                </div>
+            </div>
+
+            <!-- Live Matches Ticker on Homepage -->
+            <div id="live-matches-ticker" class="live-ticker-box hidden-element">
+                <div class="ticker-header">🔴 LIVE ARENA BATTLES (CLICK TO SPECTATE)</div>
+                <div id="live-matches-list" class="ticker-items"></div>
+            </div>
+        </div>
+
+        <div class="homepage-footer">
+            <span class="left-foot">⚡ Powered by LitVM • Zero-Trust Oracle Settlement</span>
+            <span class="right-foot">🛠️ Built by militocrypto</span>
+        </div>
+    </div>
+
+    <!-- ====================== ARENA VIEW ====================== -->
+    <div id="arena-app-wrapper" class="app-wrapper hidden-element">
+        
+        <!-- LEFT PANEL: Social, Friends & Live Spectate Hub -->
+        <div class="panel social-panel">
+            <div class="panel-header-action">
+                <h3>👥 Network Hub</h3>
+                <button id="btn-return-menu-top" class="btn-nav-back">← Home</button>
+            </div>
+            <hr>
+            <div class="search-box">
+                <input type="text" id="search-user-input" placeholder="Username or 0x...">
+                <button id="btn-search-user">Find</button>
+            </div>
+            <div id="search-result-display" class="hidden-element">
+                <div>
+                    <div id="found-username"></div>
+                    <small id="found-ratings-arena" style="color:#8fa9d4; font-size:11px;"></small>
+                </div>
+                <div style="display:flex; gap:4px;">
+                    <button id="btn-spectate-user-arena" class="btn-spectate-sm hidden-element" title="Spectate">👁️</button>
+                    <button id="btn-add-friend" title="Add Friend">+</button>
+                </div>
+            </div>
+
+            <h4>My Friends</h4>
+            <div id="friends-list" style="overflow-y: auto; flex-grow: 1;">
+                <div class="friend-item" data-username="vitalik_checkmate">
+                    <span class="status online">●</span>
+                    <span class="friend-name">vitalik_checkmate</span>
+                    <span class="friend-elo">2140</span>
+                </div>
+            </div>
+
+            <!-- Tournament Standings Box (Shown in Tourney Mode) -->
+            <div id="tourney-standings-box" class="hidden-element" style="margin-top:12px;">
+                <h4>🏆 Arena Standings</h4>
+                <div id="tourney-leaderboard-list" class="tourney-leaderboard"></div>
+            </div>
+
+            <button id="btn-return-menu" class="btn-danger menu-back-footer" style="margin-top:12px;">← Main Menu</button>
+        </div>
+
+        <!-- CENTER PANEL: Interactive Chess Arena -->
+        <div class="panel board-panel">
+            <div class="game-info-bar">
+                <div class="wallet-node-wrapper">
+                    <span class="node-indicator"></span>
+                    <span>Wallet: </span><span id="wallet-address">Not Connected</span>
+                    <button id="btn-connect-wallet-arena" class="btn-wallet-sm">Connect</button>
+                    <button id="btn-claim-payout" class="btn-wallet-sm hidden-element" style="background:#10b981; color:#04130b;">💰 Claim Payout</button>
+                </div>
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <span id="tx-status-badge" class="tx-badge hidden-element">⛓️ Settling...</span>
+                    <span id="game-phase" class="game-state-ticker">Status: Idle</span>
+                </div>
+            </div>
+
+            <div id="spectator-banner" class="spectator-banner hidden-element">
+                👁️ SPECTATOR MODE — Watching Live Zero-Trust Feed
+            </div>
+
+            <div class="match-arena-container">
+                <div id="analysis-eval-gauge" class="eval-gauge-track hidden-eval">
+                    <div id="eval-bar-fill"></div>
+                    <div class="eval-text-overlay" id="eval-text">0.0</div>
+                </div>
+                <div class="match-arena-wrapper">
+                    <!-- Opponent Bar -->
+                    <div class="player-tag-bar opponent-metadata-identity">
+                        <span class="player-avatar" id="opponent-avatar">🤖</span>
+                        <div class="player-meta-stack">
+                            <div>
+                                <span id="opponent-name" class="player-username">Opponent</span>
+                                <span id="opponent-rating" class="player-rating"></span>
+                            </div>
+                            <div class="captured-tray">
+                                <span id="opponent-captured-pieces" class="captured-pieces"></span>
+                                <span id="opponent-material-diff" class="material-badge hidden-element"></span>
+                            </div>
+                        </div>
+                        <div id="opponent-clock" class="chess-clock">03:00</div>
+                    </div>
+
+                    <!-- Chessboard Frame -->
+                    <div class="chessboard-frame" id="board-frame-wrapper" title="Right-click to clear premoves">
+                        <div id="myBoard" style="width:100%"></div>
+                    </div>
+
+                    <!-- User Bar -->
+                    <div class="player-tag-bar player-metadata-identity">
+                        <span class="player-avatar">⚔️</span>
+                        <div class="player-meta-stack">
+                            <div>
+                                <span id="user-name" class="player-username">You</span>
+                                <span id="user-rating" class="player-rating"></span>
+                            </div>
+                            <div class="captured-tray">
+                                <span id="user-captured-pieces" class="captured-pieces"></span>
+                                <span id="user-material-diff" class="material-badge hidden-element"></span>
+                            </div>
+                        </div>
+                        <div id="user-clock" class="chess-clock">03:00</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="board-utility-strip">
+                <button id="btn-flip-board" class="btn-util" title="Flip Board Orientation">🔄 Flip</button>
+                <button id="btn-copy-pgn" class="btn-util" title="Copy PGN Move History">📋 Copy PGN</button>
+                <button id="btn-copy-fen" class="btn-util" title="Copy Current FEN">🧬 Copy FEN</button>
+                <button id="btn-clear-premove" class="btn-util hidden-element" title="Clear Queued Premove">✖ Clear Premove</button>
+            </div>
+
+            <div class="action-control-row" id="live-action-controls">
+                <button id="btn-abort" class="btn-danger" disabled>Abort Match</button>
+                <button id="btn-resign" class="btn-warning" disabled>Resign Game</button>
+                <button id="btn-draw" class="btn-draw" disabled>Offer Draw</button>
+                <button id="btn-reconnect" class="btn-secondary">Reconnect</button>
+            </div>
+
+            <div id="post-game-controls" class="hidden-element">
+                <button id="btn-rematch" class="btn-primary">Offer Rematch</button>
+                <button id="btn-view-analysis" class="btn-analysis">🔍 Engine Analysis</button>
+                <button id="btn-new-game" class="btn-danger">New Opponent</button>
+            </div>
+        </div>
+
+        <!-- RIGHT PANEL: Match Setup, Move Notation & Combat Chat -->
+        <div class="panel interaction-panel">
+            <div id="match-settings-box">
+                <h3 id="mode-title-display">💰 Setup Match</h3>
+                
+                <div class="payment-toggle-wrapper" id="payment-toggle-container">
+                    <span class="toggle-label" id="free-label-text">Free Play</span>
+                    <label class="switch">
+                        <input type="checkbox" id="toggle-paid-mode" checked>
+                        <span class="slider round"></span>
+                    </label>
+                    <span class="toggle-label active-text" id="paid-label-text">Stake zkLTC</span>
+                </div>
+                <hr>
+
+                <div id="solo-difficulty-container" class="hidden-element">
+                    <label for="bot-difficulty-select">Engine Depth &amp; Strength:</label>
+                    <select id="bot-difficulty-select">
+                        <option value="easy">Easy — Club Novice (~1100)</option>
+                        <option value="medium">Medium — Tactical (~1550)</option>
+                        <option value="hard" selected>Hard — Alpha-Beta PST (~1900)</option>
+                        <option value="master">Master — Deep Search (~2200)</option>
+                    </select>
+                </div>
+
+                <div id="tournament-input-container" class="hidden-element">
+                    <label for="tourney-id-input">Tournament Arena ID:</label>
+                    <input type="text" id="tourney-id-input" placeholder="e.g. litforge-main-arena" value="litforge-main-arena">
+                </div>
+
+                <label for="time-control-select">Time Control Format:</label>
+                <select id="time-control-select">
+                    <option value="bullet">⚡ Bullet (1+0)</option>
+                    <option value="blitz" selected>🔥 Blitz (3+2)</option>
+                    <option value="rapid">⏱️ Rapid (10+0)</option>
+                </select>
+
+                <div id="side-pref-container">
+                    <label>Color Preference:</label>
+                    <div class="side-pref-buttons">
+                        <label><input type="radio" name="sidePref" value="0" checked> ♔ White</label>
+                        <label><input type="radio" name="sidePref" value="1"> ♚ Black</label>
+                        <label><input type="radio" name="sidePref" value="2"> 🎲 Random</label>
+                    </div>
+                </div>
+
+                <div id="staking-ui-container">
+                    <label>Select Escrow Wager:</label>
+                    <div class="staking-tiers">
+                        <button class="tier-btn selected-tier" data-amount="0.01">0.01 zkLTC</button>
+                        <button class="tier-btn" data-amount="0.05">0.05 zkLTC</button>
+                        <button class="tier-btn" data-amount="0.1">0.1 zkLTC</button>
+                    </div>
+                    <input type="number" id="stake-amount-input" placeholder="Custom stake (zkLTC)..." value="0.01" step="0.01" min="0.001" max="5">
+                </div>
+
+                <button id="btn-find-match" class="btn-cta-launch">JOIN MATCHMAKING QUEUE</button>
+                <button id="btn-cancel-queue" class="btn-danger hidden-element" style="width:100%; margin-top:6px;">Cancel Queue &amp; Refund</button>
+            </div>
+
+            <div id="analysis-moves-panel" class="analysis-notation-container hidden-element">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <h3>📋 Move Log &amp; Review</h3>
+                    <small style="color:#8fa9d4; font-size:11px;">Use ← / → keys</small>
+                </div>
+                <hr>
+                <div class="opening-explorer-bar">
+                    <span id="opening-name-badge">Starting Position</span>
+                    <span id="engine-best-move-badge" class="engine-best-pill hidden-element">Best: --</span>
+                </div>
+                <div class="notation-grid" id="notation-list-box"></div>
+                <div id="analysis-controls" class="action-control-row hidden-element" style="margin-top:8px; gap:4px;">
+                    <button id="btn-nav-first" title="First Move">|&lt;</button>
+                    <button id="btn-nav-prev" title="Previous Move">&lt;</button>
+                    <button id="btn-nav-next" title="Next Move">&gt;</button>
+                    <button id="btn-nav-last" title="Latest Position">&gt;|</button>
+                </div>
+            </div>
+
+            <div id="draw-offer-prompt" class="hidden-element">
+                <p style="margin:0 0 8px 0; font-weight:bold; color:#ffa726; font-size:14px;">🤝 Opponent offered a draw</p>
+                <button id="btn-accept-draw" style="background:#2e7d32; color:white; padding:6px 16px; margin-right:8px;">Accept</button>
+                <button id="btn-decline-draw" style="background:#b33939; color:white; padding:6px 16px;">Decline</button>
+            </div>
+
+            <h3 style="margin-top:12px;">💬 Combat Comms</h3>
+            <hr>
+            <div class="chat-container">
+                <div id="chat-messages-box"></div>
+                <div class="quick-chat-presets">
+                    <button class="preset-phrase">Good game!</button>
+                    <button class="preset-phrase">Your move!</button>
+                    <button class="preset-phrase">Well played!</button>
+                    <button class="preset-emoji">🤝</button>
+                    <button class="preset-emoji">👑</button>
+                    <button class="preset-emoji">⚡</button>
+                </div>
+                <div class="chat-input-row">
+                    <input type="text" id="chat-text-input" placeholder="Transmit message..." maxlength="140">
+                    <button id="btn-send-chat">Send</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ====== FLOATING TOP-RIGHT CONTROLS ====== -->
+    <div id="floating-controls" class="hidden-element">
+        <button id="btn-create-challenge" class="btn-floating-challenge">🔗 Create Challenge Link</button>
+        <div id="challenge-link-display" class="hidden-element challenge-link-box">
+            <strong>Share Direct Challenge URL:</strong><br>
+            <span id="challenge-link-text"></span>
+            <div style="display:flex; gap:6px; margin-top:6px;">
+                <button id="btn-copy-challenge-link" style="flex:1;">Copy Link</button>
+                <button id="btn-cancel-challenge" class="btn-warning" style="flex:1;">Cancel &amp; Refund</button>
+            </div>
+        </div>
+        <button id="btn-toggle-settings" class="btn-floating-settings">⚙️ Preferences</button>
+        <div id="settings-panel" class="hidden-element">
+            <h4 style="margin-top:0;">⚙️ Arena Settings</h4>
+            <label style="display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer;">
+                <input type="checkbox" id="sound-toggle" checked style="width:auto; margin:0;"> Acoustic Synthesizer Sounds
+            </label>
+            <div style="margin-top:10px;">
+                <label for="piece-theme-select">Piece Set:</label>
+                <select id="piece-theme-select" style="margin-bottom:6px;">
+                    <option value="wikipedia">Classic Tournament</option>
+                    <option value="alpha">Alpha Modern</option>
+                    <option value="merida">Merida Masters</option>
+                </select>
+            </div>
+            <div style="margin-top:6px;">
+                <label for="board-theme-select">Board Surface:</label>
+                <select id="board-theme-select" style="margin-bottom:4px;">
+                    <option value="default">Institutional Slate / Ice</option>
+                    <option value="wood">Grandmaster Walnut</option>
+                    <option value="green">Tournament Emerald</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <footer class="branding-footer">
+        <span class="left-foot">⚡ Powered by LitVM • Litforge Hackathon</span>
+        <span class="right-foot">🛠️ Built by militocrypto</span>
+    </footer>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+    <script src="public/app.js"></script>
+</body>
+</html>

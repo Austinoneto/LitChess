@@ -1,0 +1,6 @@
+{
+    "liveServer.settings.ignoreFiles": [
+        "**/server_state.json",
+        "**/ratings.json"
+    ]
+}
