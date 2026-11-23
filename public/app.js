@@ -1,6 +1,7 @@
 /**
  * ============================================================================
  * LITCHESS INSTITUTIONAL CLIENT ENGINE (public/app.js)
+ * Wired to LitSocial (public/social.js) + Zero-Trust Oracle (server.js)
  * ============================================================================
  */
 
@@ -21,8 +22,12 @@ function normalizeStake(raw) {
 
 var myUsername = "Player";
 var opponentUsername = "Opponent";
+var opponentWallet = null;
 var spectatorWhiteName = "White";
 var spectatorBlackName = "Black";
+var isReplayMode = false;
+var replayWhiteName = "White";
+var replayBlackName = "Black";
 var localClientId = "client_" + Math.random().toString(36).substring(2, 15);
 var mySessionId = null;
 
@@ -36,6 +41,7 @@ var pendingChallengeInvite = null;
 var signer = null;
 var p2pSocket = null;
 var lobbySocket = null;
+var lobbyReconnectTimer = null;
 var myAssignedColor = 'w';
 
 var currentMode = '2p';
@@ -52,7 +58,6 @@ var pendingPremoves = [];
 var selectedSquare = null;
 
 const STORAGE_KEY = 'litchess_game_state';
-const FRIENDS_STORAGE_KEY = 'litchess_friends_list';
 const SESSION_DELEGATE_PREFIX = 'litchess_delegate_auth_';
 const CONTRACT_ADDRESS = "0xB04bAF7F9784491A7041b25Bc7d3191c46Cdf73e";
 const USERNAME_REGISTRY_ADDRESS = "0x7ff44d488B5e75adF4ba35B9fbAca68ce9BE92AE";
@@ -149,7 +154,7 @@ function showToast(message, type = 'info', duration = 4000) {
 }
 
 // ============================================================================
-// 2. PROCEDURAL WEB AUDIO SYNTHESIZER
+// 2. PROCEDURAL WEB AUDIO SYNTHESIZER & GLOBAL EVENT BUS
 // ============================================================================
 class SoundManager {
     constructor() {
@@ -254,6 +259,7 @@ const EventBus = {
     },
     emit(event, data) { (this.events[event] || []).forEach(cb => cb(data)); }
 };
+window.EventBus = EventBus;
 
 // ============================================================================
 // 3. ALPHA-BETA BOT ENGINE (QUIESCENCE, CHECK EXTENSIONS, BISHOP PAIR & KING PST)
@@ -715,7 +721,7 @@ function updateCapturedPiecesAndMaterial() {
     });
 
     const diff = whiteMatScore - blackMatScore;
-    const bottomIsWhite = isSpectator ? true : (myAssignedColor === 'w');
+    const bottomIsWhite = (isSpectator || isReplayMode) ? true : (myAssignedColor === 'w');
 
     $('#user-captured-pieces').text(bottomIsWhite ? whiteCapturedStr : blackCapturedStr);
     $('#opponent-captured-pieces').text(bottomIsWhite ? blackCapturedStr : whiteCapturedStr);
@@ -1127,7 +1133,7 @@ function calculateSimulatedEvaluation(targetFen) {
 // 10. STATE PERSISTENCE & LIFECYCLE
 // ============================================================================
 function saveGameState() {
-    if (!activeMatchId || isSpectator) return;
+    if (!activeMatchId || isSpectator || isReplayMode) return;
     const state = {
         fen: game.fen(),
         pgn: game.pgn(),
@@ -1145,6 +1151,7 @@ function saveGameState() {
         isPaidMode,
         myUsername,
         opponentUsername,
+        opponentWallet,
         localClientId
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -1173,12 +1180,9 @@ function restoreGameState() {
         if (!userWalletAddress && state.userWalletAddress) {
             userWalletAddress = state.userWalletAddress.toLowerCase();
         }
-        if (state.opponentUsername) {
-            opponentUsername = state.opponentUsername;
-        }
-        if (state.opponentRatings) {
-            opponentRatings = state.opponentRatings;
-        }
+        if (state.opponentUsername) opponentUsername = state.opponentUsername;
+        if (state.opponentWallet) opponentWallet = state.opponentWallet;
+        if (state.opponentRatings) opponentRatings = state.opponentRatings;
 
         if (state.pgn) {
             game.load_pgn(state.pgn);
@@ -1395,6 +1399,11 @@ async function acceptPendingPaidChallenge() {
 
 function spectateMatchById(matchId) {
     if (!matchId) return;
+    if (isMatchActive && !gameResultSettled && !isSpectator) {
+        showToast("Finish or abort your current match before spectating.", "warn");
+        return;
+    }
+    resetMatchEnvironment();
     activeMatchId = matchId;
     isSpectator = true;
     myAssignedColor = 'w';
@@ -1407,11 +1416,14 @@ function spectateMatchById(matchId) {
 
     if (p2pSocket && p2pSocket.readyState !== WebSocket.CLOSED) p2pSocket.close();
     p2pSocket = new WebSocket(WS_URL);
+    p2pSocket._matchId = matchId;
     p2pSocket.onopen = function () {
         p2pSocket.send(JSON.stringify({
             type: 'JOIN_ROOM',
             matchId: matchId,
-            spectate: true
+            spectate: true,
+            username: myUsername,
+            wallet: userWalletAddress || null
         }));
     };
     p2pSocket.onmessage = function (event) {
@@ -1430,7 +1442,12 @@ function enterSpectatorMode() {
     $('#match-settings-box').addClass('hidden-element');
     $('#analysis-moves-panel').removeClass('hidden-element');
     $('#live-action-controls, #post-game-controls').addClass('hidden-element');
-    appendSystemMessage("👁️ Connected to live spectator feed.", false);
+
+    // Enable isolated Spectator Lounge (Railbird Chat)
+    $('#combat-chat-heading').text('👁️ Spectator Lounge (Railbird Chat)');
+    $('#chat-text-input').attr('placeholder', "Railbird chat (players can't see)...");
+    setChatEnabled(true);
+    appendSystemMessage("👁️ Connected to live spectator feed. Railbird chat is private to spectators.", false);
 }
 
 // ============================================================================
@@ -1510,6 +1527,9 @@ function setupUsernameModalHandlers() {
             updateProfileRatingsDisplay();
             $('#username-modal').addClass('hidden-element');
             showToast(`Identity "${myUsername}" registered on-chain!`, "success");
+            if (window.LitSocial && typeof window.LitSocial.onUsernameRegistered === 'function') {
+                window.LitSocial.onUsernameRegistered();
+            }
         } catch (err) {
             showToast("Registration failed or cancelled. Using Anon handle.", "warn");
             myUsername = "Anon_" + userWalletAddress.slice(-4);
@@ -1540,6 +1560,10 @@ async function autoReconnectWallet() {
             await fetchAndSetUsername();
             await checkClaimablePayoutBalance();
             setupGlobalMatchListener();
+
+            if (window.LitSocial && typeof window.LitSocial.onWalletChanged === 'function') {
+                window.LitSocial.onWalletChanged(userWalletAddress);
+            }
         }
     } catch (_) {}
 }
@@ -1597,6 +1621,10 @@ async function connectWeb3Wallet() {
         await fetchAndSetUsername();
         await checkClaimablePayoutBalance();
         setupGlobalMatchListener();
+
+        if (window.LitSocial && typeof window.LitSocial.onWalletChanged === 'function') {
+            window.LitSocial.onWalletChanged(userWalletAddress);
+        }
     } catch (err) {
         showToast("Wallet connection cancelled or failed.", "error");
     }
@@ -1614,6 +1642,9 @@ function disconnectWeb3Wallet() {
     $('#btn-claim-payout').addClass('hidden-element');
     $('#btn-connect-wallet-landing').text('🔗 CONNECT WALLET').removeClass('btn-wallet-disconnect');
     $('#btn-connect-wallet-arena').text('Connect').removeClass('btn-wallet-disconnect');
+    if (window.LitSocial && typeof window.LitSocial.onWalletChanged === 'function') {
+        window.LitSocial.onWalletChanged(null);
+    }
     showToast("Wallet disconnected.", "info");
 }
 
@@ -1639,10 +1670,12 @@ function connectToMatchedRoom(matchId, white, black) {
     }
 
     myAssignedColor = (safeWhite === safeUser) ? 'w' : 'b';
+    opponentWallet = (safeWhite === safeUser) ? safeBlack : safeWhite;
     isInQueue = false;
     activeMatchId = matchId;
     isPaidMode = true;
     isSpectator = false;
+    isReplayMode = false;
 
     clearAllTimers();
     $('#btn-cancel-queue').addClass('hidden-element');
@@ -1996,6 +2029,11 @@ function requestMatchAbort() {
 // 14. P2P MESSAGE HANDLER
 // ============================================================================
 function handleStandardP2PMessage(data, isRestored = false) {
+    if (!data || !data.type) return;
+
+    // Ignore social handshake banner on match sockets (handled exclusively by lobbySocket)
+    if (data.type === 'SOCIAL_HELLO' || data.type === 'LOBBY_TELEMETRY') return;
+
     if (data.type === 'ERROR') {
         appendSystemMessage("⚠️ " + data.reason, true);
         showToast(data.reason, "error");
@@ -2042,7 +2080,15 @@ function handleStandardP2PMessage(data, isRestored = false) {
     }
 
     if (data.type === 'SPECTATOR_MODE') {
+        if (data.sessionId) mySessionId = data.sessionId;
         enterSpectatorMode();
+        return;
+    }
+
+    if (data.type === 'RECEIVE_SPECTATOR_CHAT') {
+        if (data.fromClientId !== mySessionId) {
+            appendSpectatorMessage(data.sender, data.text);
+        }
         return;
     }
 
@@ -2125,8 +2171,11 @@ function handleStandardP2PMessage(data, isRestored = false) {
                 opponentDisconnectTimer = null;
             }
             isSpectator = false;
+            isReplayMode = false;
             isAnalysisMode = false;
             $('#spectator-banner').addClass('hidden-element');
+            $('#combat-chat-heading').text('💬 Combat Comms');
+            $('#chat-text-input').attr('placeholder', 'Transmit message...');
             board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
             reapplyBoardHighlights();
             setChatEnabled(true);
@@ -2214,17 +2263,20 @@ function handleStandardP2PMessage(data, isRestored = false) {
             if (isSpectator) {
                 spectatorWhiteName = data.whiteUsername || 'White';
                 spectatorBlackName = data.blackUsername || 'Black';
+                opponentWallet = data.blackWallet || null;
                 if (data.whiteRatings) playerRatings = data.whiteRatings;
                 if (data.blackRatings) opponentRatings = data.blackRatings;
             } else {
                 if (myAssignedColor === 'w') {
                     if (data.whiteUsername && data.whiteUsername !== 'White') myUsername = data.whiteUsername;
                     if (data.blackUsername && data.blackUsername !== 'Black') opponentUsername = data.blackUsername;
+                    if (data.blackWallet) opponentWallet = data.blackWallet;
                     if (data.whiteRatings) playerRatings = data.whiteRatings;
                     if (data.blackRatings) opponentRatings = data.blackRatings;
                 } else {
                     if (data.blackUsername && data.blackUsername !== 'Black') myUsername = data.blackUsername;
                     if (data.whiteUsername && data.whiteUsername !== 'White') opponentUsername = data.whiteUsername;
+                    if (data.whiteWallet) opponentWallet = data.whiteWallet;
                     if (data.blackRatings) playerRatings = data.blackRatings;
                     if (data.whiteRatings) opponentRatings = data.whiteRatings;
                 }
@@ -2267,6 +2319,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
         case 'USER_INFO':
             if (!isSpectator && (data.fromClientId !== mySessionId || (data.color && data.color !== myAssignedColor))) {
                 opponentUsername = String(data.username || 'Opponent').slice(0, 32);
+                if (data.wallet) opponentWallet = data.wallet;
                 if (data.ratings) opponentRatings = data.ratings;
                 updateProfileRatingsDisplay();
                 appendSystemMessage(`⚔️ Matched against ${opponentUsername}`, false);
@@ -2689,117 +2742,209 @@ function initChessboard() {
 }
 
 // ============================================================================
-// 16. LOBBY TELEMETRY & PLAYER SEARCH
+// 16. PERSISTENT LOBBY TELEMETRY & SOCIAL PRESENCE SOCKET + BRIDGE
 // ============================================================================
 function connectLobbyTelemetrySocket() {
     if (lobbySocket && lobbySocket.readyState === WebSocket.OPEN) {
         lobbySocket.send(JSON.stringify({ type: 'GET_LOBBY_TELEMETRY' }));
         return;
     }
+    if (lobbySocket && lobbySocket.readyState === WebSocket.CONNECTING) {
+        return;
+    }
+
     try {
         lobbySocket = new WebSocket(WS_URL);
-        lobbySocket.onmessage = function (ev) {
-            const data = JSON.parse(ev.data);
-            if (data.type === 'LOBBY_TELEMETRY') {
-                if (data.totalGames) $('#total-games').text(Number(data.totalGames).toLocaleString());
-                if (data.activeGames !== undefined) $('#active-games').text(data.activeGames);
-                if (data.playersOnline !== undefined) $('#players-online').text(data.playersOnline);
 
-                const listEl = $('#live-matches-list').empty();
-                if (Array.isArray(data.liveMatches) && data.liveMatches.length > 0) {
-                    $('#live-matches-ticker').removeClass('hidden-element');
-                    data.liveMatches.forEach(m => {
-                        const pill = $(`<div class="ticker-match-pill">⚔️ <strong>${sanitizeHTML(m.white)}</strong> vs <strong>${sanitizeHTML(m.black)}</strong> (${m.timeControl})</div>`);
-                        pill.click(() => spectateMatchById(m.matchId));
-                        listEl.append(pill);
-                    });
-                } else {
-                    $('#live-matches-ticker').addClass('hidden-element');
+        lobbySocket.onopen = function () {
+            if (lobbyReconnectTimer) {
+                clearTimeout(lobbyReconnectTimer);
+                lobbyReconnectTimer = null;
+            }
+            if (window.LitSocial && typeof window.LitSocial.onSocketOpen === 'function') {
+                window.LitSocial.onSocketOpen(lobbySocket);
+            }
+            lobbySocket.send(JSON.stringify({ type: 'GET_LOBBY_TELEMETRY' }));
+        };
+
+        lobbySocket.onmessage = function (ev) {
+            try {
+                const data = JSON.parse(ev.data);
+
+                // Route all social, presence, search, profile, DM, club & direct challenge messages to LitSocial
+                if (window.LitSocial && typeof window.LitSocial.handleMessage === 'function') {
+                    if (window.LitSocial.handleMessage(data)) return;
                 }
-            } else if (data.type === 'SEARCH_USER_RESULT') {
-                renderSearchUserResult(data);
+
+                if (data.type === 'LOBBY_TELEMETRY') {
+                    if (data.totalGames) $('#total-games').text(Number(data.totalGames).toLocaleString());
+                    if (data.activeGames !== undefined) $('#active-games').text(data.activeGames);
+                    if (data.playersOnline !== undefined) $('#players-online').text(data.playersOnline);
+
+                    const listEl = $('#live-matches-list').empty();
+                    if (Array.isArray(data.liveMatches) && data.liveMatches.length > 0) {
+                        $('#live-matches-ticker').removeClass('hidden-element');
+                        data.liveMatches.forEach(m => {
+                            const pill = $(`<div class="ticker-match-pill">⚔️ <strong>${sanitizeHTML(m.white)}</strong> vs <strong>${sanitizeHTML(m.black)}</strong> (${m.timeControl})</div>`);
+                            pill.click(() => spectateMatchById(m.matchId));
+                            listEl.append(pill);
+                        });
+                    } else {
+                        $('#live-matches-ticker').addClass('hidden-element');
+                    }
+                }
+            } catch (_) {}
+        };
+
+        lobbySocket.onclose = function () {
+            if (!lobbyReconnectTimer) {
+                lobbyReconnectTimer = setTimeout(() => {
+                    lobbyReconnectTimer = null;
+                    connectLobbyTelemetrySocket();
+                }, 3500);
             }
         };
     } catch (_) {}
 }
 
-function renderSearchUserResult(data) {
-    const r = data.ratings || { bullet: 2000, blitz: 2000, rapid: 2000 };
-    const summary = `⚡ Bullet ${r.bullet} • 🔥 Blitz ${r.blitz} • ⏱️ Rapid ${r.rapid}`;
+// Bridge API consumed by public/social.js
+window.LitChessBridge = {
+    getContext() {
+        return {
+            wallet: userWalletAddress,
+            username: myUsername,
+            signer,
+            contract: chessContractInstance,
+            lobbySocket,
+            opponentWallet,
+            opponentUsername,
+            isMatchActive
+        };
+    },
 
-    $('#found-username-home, #found-username').text(data.username);
-    $('#found-ratings-home, #found-ratings-arena').text(summary);
-    $('#search-result-display-home, #search-result-display').removeClass('hidden-element');
+    launchDirectMatch(data) {
+        if (!data || !data.matchId) return;
+        if (isMatchActive && !gameResultSettled && !isSpectator) {
+            showToast("Finish your current match before starting a new duel.", "warn");
+            return;
+        }
 
-    if (data.activeMatchId) {
-        $('#btn-spectate-user-home, #btn-spectate-user-arena')
-            .removeClass('hidden-element')
-            .off('click')
-            .on('click', () => spectateMatchById(data.activeMatchId));
-    } else {
-        $('#btn-spectate-user-home, #btn-spectate-user-arena').addClass('hidden-element');
+        resetMatchEnvironment();
+        currentMode = '2p';
+        isPaidMode = !!data.isPaid;
+
+        $('#toggle-paid-mode').prop('checked', isPaidMode);
+        $('#staking-ui-container').toggleClass('disabled-ui', !isPaidMode);
+        $('#paid-label-text').toggleClass('active-text', isPaidMode);
+        $('#free-label-text').toggleClass('active-text', !isPaidMode);
+
+        if (data.timeControl && timeControlLimits[data.timeControl]) {
+            $('#time-control-select').val(data.timeControl);
+        }
+        if (data.isPaid && data.stake) {
+            $('#stake-amount-input').val(data.stake);
+        }
+
+        setupUIPerMode();
+        resetClocksToSelectedFormat();
+
+        $('#home-view-container').addClass('hidden-element');
+        $('#arena-app-wrapper').removeClass('hidden-element');
+        if (board === null) initChessboard();
+        else board.resize();
+
+        activeMatchId = data.matchId;
+        myAssignedColor = data.color || 'w';
+        opponentUsername = data.opponentName || 'Opponent';
+        opponentWallet = data.opponentWallet || null;
+        isSpectator = false;
+        isReplayMode = false;
+
+        board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
+        reapplyBoardHighlights();
+        updateProfileRatingsDisplay();
+        updateFloatingControls();
+
+        $('#match-settings-box').addClass('hidden-element');
+        $('#btn-find-match').prop('disabled', true).text("Match in Progress");
+
+        establishP2PConnection(activeMatchId, false);
+        saveGameState();
+        showToast(`⚔️ Direct duel launched vs ${opponentUsername} (${myAssignedColor === 'w' ? 'WHITE' : 'BLACK'})!`, "success");
+    },
+
+    loadReplayForAnalysis(gameRecord) {
+        if (!gameRecord || !gameRecord.pgn) {
+            showToast("No PGN moves stored for this match.", "warn");
+            return;
+        }
+        if (isMatchActive && !gameResultSettled && !isSpectator) {
+            showToast("Finish your live match before opening a replay.", "warn");
+            return;
+        }
+
+        resetMatchEnvironment();
+        $('#home-view-container').addClass('hidden-element');
+        $('#arena-app-wrapper').removeClass('hidden-element');
+        if (board === null) initChessboard();
+        else board.resize();
+
+        isReplayMode = true;
+        replayWhiteName = gameRecord.whiteName || 'White';
+        replayBlackName = gameRecord.blackName || 'Black';
+        gameResultSettled = true;
+        isAnalysisMode = true;
+        isMatchActive = false;
+        myAssignedColor = 'w';
+
+        game.reset();
+        game.load_pgn(gameRecord.pgn);
+        analysisMovesList = game.history();
+        analysisCurrentIndex = analysisMovesList.length - 1;
+        analysisGame.load(game.fen());
+
+        board.orientation('white');
+        $('#match-settings-box, #live-action-controls, #btn-rematch, #btn-view-analysis').addClass('hidden-element');
+        $('#post-game-controls, #analysis-moves-panel, #analysis-controls').removeClass('hidden-element');
+        $('#analysis-eval-gauge').removeClass('hidden-eval');
+        $('#game-phase').text(`Status: Replay Review (${(gameRecord.timeControl || 'blitz').toUpperCase()})`);
+
+        updateProfileRatingsDisplay();
+        renderLiveMoveNotation();
+        displayHistoricalMoveIndex();
+        updateFloatingControls();
+        showToast(`Loaded replay: ${replayWhiteName} vs ${replayBlackName}. Use ← / → or play variations!`, "info", 4000);
+    },
+
+    openClubTournament(tourneyId) {
+        if (isMatchActive && !gameResultSettled && !isSpectator) {
+            showToast("Finish your live match before entering a club tournament.", "warn");
+            return;
+        }
+        resetMatchEnvironment();
+        currentMode = 'tourney';
+        setupUIPerMode();
+        $('#home-view-container').addClass('hidden-element');
+        $('#arena-app-wrapper').removeClass('hidden-element');
+        if (board === null) initChessboard();
+        else board.resize();
+
+        $('#tourney-id-input').val(tourneyId);
+        updateFloatingControls();
+        showToast(`🏆 Club Arena "${tourneyId}" loaded! Choose Free or Stake zkLTC and click Join Tournament.`, "info", 4500);
     }
-}
-
-function loadFriendsFromStorage() {
-    const raw = localStorage.getItem(FRIENDS_STORAGE_KEY);
-    if (!raw) return;
-    try {
-        const list = JSON.parse(raw);
-        const container = $('#friends-list').empty();
-        list.forEach(f => {
-            const item = $(`
-                <div class="friend-item" data-username="${sanitizeHTML(f.username)}">
-                    <div><span class="status online">●</span><span class="friend-name">${sanitizeHTML(f.username)}</span></div>
-                    <span class="friend-elo">${f.blitz || 2000}</span>
-                </div>
-            `);
-            item.click(() => {
-                $('#search-user-input').val(f.username);
-                triggerUserSearch(f.username);
-            });
-            container.append(item);
-        });
-    } catch (_) {}
-}
-
-function saveFriendToStorage(username, blitzRating = 2000) {
-    if (!username) return;
-    let list = [];
-    try { list = JSON.parse(localStorage.getItem(FRIENDS_STORAGE_KEY) || '[]'); } catch (_) {}
-    if (!list.some(f => f.username.toLowerCase() === username.toLowerCase())) {
-        list.push({ username, blitz: blitzRating });
-        localStorage.setItem(FRIENDS_STORAGE_KEY, JSON.stringify(list));
-    }
-    loadFriendsFromStorage();
-    showToast(`${username} added to your Friends Hub!`, "success");
-}
-
-function triggerUserSearch(query) {
-    if (!query) return;
-    const sock = (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) ? p2pSocket : lobbySocket;
-    if (sock && sock.readyState === WebSocket.OPEN) {
-        sock.send(JSON.stringify({ type: 'SEARCH_USER', query }));
-    } else {
-        connectLobbyTelemetrySocket();
-        setTimeout(() => {
-            if (lobbySocket && lobbySocket.readyState === WebSocket.OPEN) {
-                lobbySocket.send(JSON.stringify({ type: 'SEARCH_USER', query }));
-            }
-        }, 400);
-    }
-}
+};
 
 // ============================================================================
 // 17. UI HELPERS & MATCH LIFECYCLE
 // ============================================================================
 function sanitizeHTML(str) {
     return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+        .replace(/&/g, '\x26amp;')
+        .replace(/</g, '\x26lt;')
+        .replace(/>/g, '\x26gt;')
+        .replace(/"/g, '\x26quot;')
+        .replace(/'/g, '\x26#39;');
 }
 
 function getTimeControlValue() {
@@ -2813,19 +2958,41 @@ function getSidePreferenceValue() {
     return parseInt($('input[name="sidePref"]:checked').val() || 2, 10);
 }
 
+function updateQuickAddOpponentButton() {
+    const canQuickAdd = !isSpectator &&
+        !isReplayMode &&
+        currentMode !== 'solo' &&
+        !!opponentWallet &&
+        !!userWalletAddress &&
+        opponentWallet.toLowerCase() !== userWalletAddress.toLowerCase() &&
+        !(window.LitSocial && typeof window.LitSocial.isFriend === 'function' && window.LitSocial.isFriend(opponentWallet));
+
+    $('#btn-quick-add-opponent').toggleClass('hidden-element', !canQuickAdd);
+}
+
 function updateProfileRatingsDisplay() {
     var activeFormat = $('#time-control-select').val();
+    if (isReplayMode) {
+        $('#user-name').text(replayWhiteName);
+        $('#user-rating').text('(White)');
+        $('#opponent-name').text(replayBlackName);
+        $('#opponent-rating').text('(Black)');
+        updateQuickAddOpponentButton();
+        return;
+    }
     if (isSpectator) {
         $('#user-name').text(spectatorWhiteName);
         $('#user-rating').text(`(${playerRatings[activeFormat] || 2000})`);
         $('#opponent-name').text(spectatorBlackName);
         $('#opponent-rating').text(`(${opponentRatings[activeFormat] || 2000})`);
+        updateQuickAddOpponentButton();
         return;
     }
     $('#user-name').text(myUsername);
     $('#user-rating').text(currentMode !== 'solo' ? `(${playerRatings[activeFormat] || 2000})` : '');
     $('#opponent-name').text(opponentUsername);
     $('#opponent-rating').text(currentMode !== 'solo' ? `(${opponentRatings[activeFormat] || 2000})` : '');
+    updateQuickAddOpponentButton();
 }
 
 function resetClocksToSelectedFormat() {
@@ -2908,7 +3075,7 @@ function handleMatchCompletion(result, reason = '') {
     clearAllTimers();
     clearPendingPremoves();
     clearSquareSelection();
-    setChatEnabled(false);
+    if (!isSpectator) setChatEnabled(false);
     isMatchActive = false;
     $('.chess-clock').removeClass('clock-running');
     $('#live-action-controls').addClass('hidden-element');
@@ -2941,14 +3108,19 @@ function resetMatchEnvironment() {
     analysisCurrentIndex = -1;
     gameResultSettled = false;
     isAnalysisMode = false;
+    isReplayMode = false;
     pendingDrawOffer = false;
     pendingRematchOffer = false;
     isInQueue = false;
     activeMatchId = null;
     isMatchActive = false;
     isSpectator = false;
+    opponentWallet = null;
+    opponentUsername = "Opponent";
     setChatEnabled(false);
 
+    $('#combat-chat-heading').text('💬 Combat Comms');
+    $('#chat-text-input').attr('placeholder', 'Transmit message...');
     $('#challenge-link-display, #spectator-banner, #tx-status-badge, #engine-best-move-badge').addClass('hidden-element');
     $('#analysis-eval-gauge').addClass('hidden-eval');
     $('#analysis-controls, #analysis-moves-panel, #post-game-controls').addClass('hidden-element');
@@ -2956,7 +3128,7 @@ function resetMatchEnvironment() {
     $('#btn-abort').prop('disabled', true).text("Abort Match");
     $('#btn-resign, #btn-draw').prop('disabled', true);
     $('#game-phase').text("Status: Idle");
-    $('#btn-view-analysis').removeClass('hidden-element');
+    $('#btn-view-analysis, #btn-rematch').removeClass('hidden-element');
     $('#opening-name-badge').text("Starting Position");
     $('#notation-list-box').empty();
 
@@ -3134,6 +3306,12 @@ function appendMessage(sender, text) {
     chatBox.scrollTop(chatBox[0].scrollHeight);
 }
 
+function appendSpectatorMessage(sender, text) {
+    var chatBox = $('#chat-messages-box');
+    chatBox.append(`<div class="spectator-msg"><span class="sender">👁️ ${sanitizeHTML(sender)}:</span> ${sanitizeHTML(text)}</div>`);
+    chatBox.scrollTop(chatBox[0].scrollHeight);
+}
+
 function appendSystemMessage(text, isWarning) {
     var chatBox = $('#chat-messages-box');
     chatBox.append(`<div class="${isWarning ? "warning-msg" : "system-msg"}">${sanitizeHTML(text)}</div>`);
@@ -3178,12 +3356,14 @@ function startSoloMatch() {
     if (pref === 2) pref = Math.random() < 0.5 ? 0 : 1;
     myAssignedColor = pref === 0 ? 'w' : 'b';
 
+    opponentWallet = null;
     opponentUsername = "LitEngine (" + $('#bot-difficulty-select').val().toUpperCase() + ")";
     updateProfileRatingsDisplay();
     board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
     isMatchActive = true;
     isAuthenticated = true;
     isAnalysisMode = false;
+    isReplayMode = false;
     gameResultSettled = false;
     game.reset();
     analysisGame.reset();
@@ -3285,7 +3465,6 @@ $(document).ready(function () {
     });
 
     loadSettings();
-    loadFriendsFromStorage();
     setupUsernameModalHandlers();
     connectLobbyTelemetrySocket();
     setInterval(connectLobbyTelemetrySocket, 12000);
@@ -3359,9 +3538,16 @@ $(document).ready(function () {
     $('#btn-send-chat').click(() => {
         var rawInput = $('#chat-text-input').val().trim();
         if (!rawInput) return;
-        appendMessage(myUsername, rawInput);
-        if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
-            p2pSocket.send(JSON.stringify({ type: 'CHAT_MESSAGE', sessionId: mySessionId, text: rawInput }));
+        if (isSpectator) {
+            appendSpectatorMessage(myUsername, rawInput);
+            if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
+                p2pSocket.send(JSON.stringify({ type: 'SPECTATOR_CHAT', text: rawInput, sender: myUsername }));
+            }
+        } else {
+            appendMessage(myUsername, rawInput);
+            if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
+                p2pSocket.send(JSON.stringify({ type: 'CHAT_MESSAGE', sessionId: mySessionId, text: rawInput }));
+            }
         }
         $('#chat-text-input').val('');
     });
@@ -3423,11 +3609,6 @@ $(document).ready(function () {
     });
     $('#btn-cancel-queue').click(() => cancelQueue());
     $('#btn-reconnect').click(() => strengthenReconnection());
-
-    $('#btn-search-user-home').click(() => triggerUserSearch($('#search-user-input-home').val().trim()));
-    $('#btn-search-user').click(() => triggerUserSearch($('#search-user-input').val().trim()));
-    $('#btn-add-friend-home').click(() => saveFriendToStorage($('#found-username-home').text()));
-    $('#btn-add-friend').click(() => saveFriendToStorage($('#found-username').text()));
 
     $('.tier-btn').click(function () {
         $('.tier-btn').removeClass('selected-tier');

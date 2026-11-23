@@ -6,11 +6,16 @@
     <title>LitChess — Institutional Decentralized Chess Protocol</title>
     <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
     <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="public/social.css">
 </head>
 <body>
 
     <!-- ====================== NON-BLOCKING TOAST CONTAINER ====================== -->
     <div id="toast-container" aria-live="polite"></div>
+
+    <!-- ====================== LIVE DIRECT CHALLENGE BANNERS ====================== -->
+    <div id="incoming-challenge-banner" class="challenge-toast-banner hidden-element"></div>
+    <div id="outgoing-challenge-banner" class="challenge-toast-banner challenge-outgoing hidden-element"></div>
 
     <!-- ====================== ON-CHAIN USERNAME MODAL ====================== -->
     <div id="username-modal" class="modal-backdrop hidden-element">
@@ -25,13 +30,175 @@
         </div>
     </div>
 
+    <!-- ====================== PLAYER PROFILE DOSSIER MODAL ====================== -->
+    <div id="player-profile-modal" class="modal-backdrop hidden-element">
+        <div class="modal-card profile-modal-card">
+            <div class="profile-modal-top">
+                <div class="profile-identity-block">
+                    <div class="profile-name-row">
+                        <span id="prof-presence-dot"></span>
+                        <h3 id="prof-username" style="margin:0;">Player</h3>
+                        <span id="prof-club-badge" class="club-tag-pill hidden-element"></span>
+                        <span id="prof-rival-badge" class="rival-pill hidden-element">⚔️ RIVAL</span>
+                    </div>
+                    <div class="profile-sub-row">
+                        <span id="prof-presence-label" class="prof-status-text">Offline</span>
+                        <span>•</span>
+                        <span id="prof-wallet-short" class="prof-wallet-mono">0x...</span>
+                        <button id="btn-prof-copy-wallet" class="btn-icon-xs" title="Copy Wallet Address">📋</button>
+                    </div>
+                </div>
+                <button id="btn-close-profile-modal" class="btn-modal-close" title="Close">✕</button>
+            </div>
+
+            <div id="prof-action-bar" class="prof-action-bar"></div>
+
+            <div class="prof-ratings-grid">
+                <div class="prof-rating-box">
+                    <small>⚡ Bullet</small>
+                    <strong id="prof-elo-bullet">2000</strong>
+                </div>
+                <div class="prof-rating-box">
+                    <small>🔥 Blitz</small>
+                    <strong id="prof-elo-blitz">2000</strong>
+                </div>
+                <div class="prof-rating-box">
+                    <small>⏱️ Rapid</small>
+                    <strong id="prof-elo-rapid">2000</strong>
+                </div>
+                <div class="prof-rating-box">
+                    <small>💰 zkLTC Won</small>
+                    <strong id="prof-zkl-won" style="color:#00e676;">0</strong>
+                </div>
+            </div>
+
+            <div class="prof-stats-strip">
+                <div class="prof-wdl-header">
+                    <span id="prof-wdl-text">0W • 0D • 0L (0 games)</span>
+                    <span id="prof-streak-text" class="prof-streak-pill"></span>
+                </div>
+                <div class="wdl-bar-track">
+                    <div id="wdl-bar-w" class="wdl-seg-w" style="width:33%;"></div>
+                    <div id="wdl-bar-d" class="wdl-seg-d" style="width:34%;"></div>
+                    <div id="wdl-bar-l" class="wdl-seg-l" style="width:33%;"></div>
+                </div>
+                <div class="prof-form-row">
+                    <small>Recent Form:</small>
+                    <div id="prof-form-pills" class="form-pills-wrap"></div>
+                </div>
+            </div>
+
+            <div id="prof-h2h-box" class="prof-h2h-box hidden-element">
+                <div class="prof-h2h-left">
+                    <strong id="prof-h2h-title">Head-to-Head vs You</strong>
+                    <span id="prof-h2h-score">0W – 0D – 0L</span>
+                </div>
+                <button id="btn-prof-run-it-back" class="btn-run-it-back">⚔️ Run It Back</button>
+            </div>
+
+            <div class="prof-section">
+                <div class="prof-section-title">Recent Matches (Click to Analyze)</div>
+                <div id="prof-recent-games" class="prof-games-list"></div>
+            </div>
+
+            <div id="prof-note-section" class="prof-section">
+                <div class="prof-section-title">Private Scouting Notes (Only Visible to You)</div>
+                <div class="prof-note-row">
+                    <input type="text" id="prof-note-input" placeholder="e.g. Plays Sicilian Najdorf, dangerous in Bullet..." maxlength="300">
+                    <button id="btn-prof-save-note" class="btn-secondary">Save</button>
+                </div>
+            </div>
+
+            <div id="prof-safety-bar" class="prof-safety-bar">
+                <button id="btn-prof-block" class="btn-text-danger">🚫 Block User</button>
+                <button id="btn-prof-report" class="btn-text-muted">🚩 Report Abuse</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ====================== 1-CLICK DIRECT CHALLENGE MODAL ====================== -->
+    <div id="direct-challenge-modal" class="modal-backdrop hidden-element">
+        <div class="modal-card challenge-modal-card">
+            <div class="profile-modal-top">
+                <h3 style="margin:0;">⚔️ Direct Challenge</h3>
+                <button id="btn-close-challenge-modal" class="btn-modal-close">✕</button>
+            </div>
+            <p class="modal-subtitle">Send an instant live invite to <strong id="dc-target-name" style="color:#fff;">Player</strong>.</p>
+
+            <label for="dc-time-control">Time Control:</label>
+            <select id="dc-time-control">
+                <option value="bullet">⚡ Bullet (1+0)</option>
+                <option value="blitz" selected>🔥 Blitz (3+2)</option>
+                <option value="rapid">⏱️ Rapid (10+0)</option>
+            </select>
+
+            <div class="payment-toggle-wrapper">
+                <span class="toggle-label" id="dc-free-label">Free Duel</span>
+                <label class="switch">
+                    <input type="checkbox" id="dc-paid-toggle">
+                    <span class="slider round"></span>
+                </label>
+                <span class="toggle-label" id="dc-paid-label">Stake zkLTC</span>
+            </div>
+
+            <div id="dc-side-wrap">
+                <label>Your Color:</label>
+                <div class="side-pref-buttons">
+                    <label><input type="radio" name="dcSidePref" value="0"> ♔ White</label>
+                    <label><input type="radio" name="dcSidePref" value="1"> ♚ Black</label>
+                    <label><input type="radio" name="dcSidePref" value="2" checked> 🎲 Random</label>
+                </div>
+            </div>
+
+            <div id="dc-stake-wrap" class="hidden-element">
+                <label>Wager Amount (zkLTC) — Challenger plays White on-chain:</label>
+                <div class="staking-tiers">
+                    <button type="button" class="dc-tier-btn tier-btn selected-tier" data-amount="0.01">0.01 zkLTC</button>
+                    <button type="button" class="dc-tier-btn tier-btn" data-amount="0.05">0.05 zkLTC</button>
+                    <button type="button" class="dc-tier-btn tier-btn" data-amount="0.1">0.1 zkLTC</button>
+                </div>
+                <input type="number" id="dc-stake-input" value="0.01" step="0.01" min="0.001" max="5">
+            </div>
+
+            <div class="modal-actions">
+                <button id="btn-dc-cancel" class="btn-secondary">Cancel</button>
+                <button id="btn-dc-send" class="btn-cta-launch" style="width:auto; padding:10px 20px;">Send Challenge</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ====================== CREATE CLUB / GUILD MODAL ====================== -->
+    <div id="create-club-modal" class="modal-backdrop hidden-element">
+        <div class="modal-card">
+            <div class="profile-modal-top">
+                <h3 style="margin:0;">🛡️ Found a Chess Club</h3>
+                <button id="btn-close-club-modal" class="btn-modal-close">✕</button>
+            </div>
+            <p class="modal-subtitle">Create a guild with a custom tag, internal chat room, leaderboard, and club arena.</p>
+            <label for="club-create-name">Club Name (3–28 chars):</label>
+            <input type="text" id="club-create-name" placeholder="e.g. Lagos Grandmasters" maxlength="28">
+            <label for="club-create-tag">Clan Tag (2–6 letters/numbers):</label>
+            <input type="text" id="club-create-tag" placeholder="e.g. LAGOS" maxlength="6" style="text-transform:uppercase;">
+            <label for="club-create-desc">Motto / Description:</label>
+            <input type="text" id="club-create-desc" placeholder="Competitive blitz & wagered battles." maxlength="140">
+            <div class="modal-actions">
+                <button id="btn-club-create-cancel" class="btn-secondary">Cancel</button>
+                <button id="btn-club-create-submit" class="btn-cta-launch" style="width:auto; padding:10px 18px;">Create Club</button>
+            </div>
+        </div>
+    </div>
+
     <!-- ====================== HOMEPAGE VIEW ====================== -->
     <div id="home-view-container" class="hero">
         <div class="landing-top-bar">
             <div class="protocol-badge">
                 <span class="pulse-dot"></span> LITVM ZERO-TRUST ESCROW PROTOCOL
             </div>
-            <div class="landing-wallet-anchor">
+            <div class="landing-wallet-anchor" style="display:flex; align-items:center; gap:10px; position:relative;">
+                <button id="btn-social-bell-home" class="btn-social-bell" title="Social Notifications">
+                    🔔 <span id="social-bell-badge-home" class="notif-pill hidden-element">0</span>
+                </button>
+                <div id="home-social-popover" class="home-social-popover hidden-element"></div>
                 <button id="btn-connect-wallet-landing" class="btn-wallet-neon">🔗 CONNECT WALLET</button>
             </div>
         </div>
@@ -74,10 +241,15 @@
                 </div>
             </div>
 
-            <div class="global-search">
-                <input type="text" id="search-user-input-home" placeholder="🔎 Search player username or 0x wallet address...">
-                <button id="btn-search-user-home">Inspect</button>
+            <div class="global-search-wrap">
+                <div class="global-search">
+                    <input type="text" id="search-user-input-home" autocomplete="off" placeholder="🔎 Search player username or 0x wallet address...">
+                    <button id="btn-search-user-home">Inspect</button>
+                </div>
+                <div id="search-dropdown-home" class="search-autocomplete-dropdown hidden-element"></div>
             </div>
+
+            <!-- Legacy hidden fallback anchors preserved for safety -->
             <div id="search-result-display-home" class="hidden-element search-res-home">
                 <div class="search-user-meta">
                     <strong id="found-username-home"></strong>
@@ -105,17 +277,24 @@
     <!-- ====================== ARENA VIEW ====================== -->
     <div id="arena-app-wrapper" class="app-wrapper hidden-element">
         
-        <!-- LEFT PANEL: Social, Friends & Live Spectate Hub -->
+        <!-- LEFT PANEL: Upgraded Social, Friends, Requests, DMs, Clubs & Activity Hub -->
         <div class="panel social-panel">
             <div class="panel-header-action">
-                <h3>👥 Network Hub</h3>
+                <h3 style="margin-bottom:0;">👥 Network Hub</h3>
                 <button id="btn-return-menu-top" class="btn-nav-back">← Home</button>
             </div>
-            <hr>
-            <div class="search-box">
-                <input type="text" id="search-user-input" placeholder="Username or 0x...">
-                <button id="btn-search-user">Find</button>
+            <hr style="margin-top:8px;">
+
+            <!-- Debounced Multi-Result Search -->
+            <div class="arena-search-wrap">
+                <div class="search-box">
+                    <input type="text" id="search-user-input" autocomplete="off" placeholder="Search player or 0x...">
+                    <button id="btn-search-user">Find</button>
+                </div>
+                <div id="search-dropdown-arena" class="search-autocomplete-dropdown hidden-element"></div>
             </div>
+
+            <!-- Legacy fallback hidden container -->
             <div id="search-result-display" class="hidden-element">
                 <div>
                     <div id="found-username"></div>
@@ -127,22 +306,122 @@
                 </div>
             </div>
 
-            <h4>My Friends</h4>
-            <div id="friends-list" style="overflow-y: auto; flex-grow: 1;">
-                <div class="friend-item" data-username="vitalik_checkmate">
-                    <span class="status online">●</span>
-                    <span class="friend-name">vitalik_checkmate</span>
-                    <span class="friend-elo">2140</span>
+            <!-- Social Navigation Tabs -->
+            <div class="social-tabs" role="tablist">
+                <button class="social-tab-btn active" data-tab="friends" title="Friends & Following">Friends</button>
+                <button class="social-tab-btn" data-tab="requests" title="Friend Requests">
+                    Reqs <span id="badge-tab-requests" class="tab-badge hidden-element">0</span>
+                </button>
+                <button class="social-tab-btn" data-tab="dms" title="Direct Messages">
+                    DMs <span id="badge-tab-dms" class="tab-badge hidden-element">0</span>
+                </button>
+                <button class="social-tab-btn" data-tab="clubs" title="Clubs & Guilds">Clubs</button>
+                <button class="social-tab-btn" data-tab="feed" title="Activity & Top Players">Feed</button>
+            </div>
+
+            <!-- TAB 1: FRIENDS & FOLLOWING -->
+            <div id="social-pane-friends" class="social-tab-pane">
+                <div class="social-subhead">
+                    <span>Mutual Friends</span>
+                    <small id="friends-online-count" class="muted-counter">0 online</small>
+                </div>
+                <div id="friends-list" class="social-scroll-list">
+                    <div class="social-empty-state">Connect wallet to sync your friends & live status.</div>
+                </div>
+
+                <div class="social-subhead" style="margin-top:10px;">
+                    <span>Following</span>
+                    <small id="following-count" class="muted-counter">0</small>
+                </div>
+                <div id="following-list" class="social-scroll-list social-scroll-compact">
+                    <div class="social-empty-state">Follow top players to track & spectate them.</div>
+                </div>
+            </div>
+
+            <!-- TAB 2: REQUESTS & BLOCKED -->
+            <div id="social-pane-requests" class="social-tab-pane hidden-element">
+                <div class="social-subhead"><span>Incoming Requests</span></div>
+                <div id="incoming-requests-list" class="social-scroll-list social-scroll-compact">
+                    <div class="social-empty-state">No pending requests.</div>
+                </div>
+
+                <div class="social-subhead" style="margin-top:10px;"><span>Sent Requests</span></div>
+                <div id="outgoing-requests-list" class="social-scroll-list social-scroll-compact">
+                    <div class="social-empty-state">No outgoing requests.</div>
+                </div>
+
+                <div class="social-subhead" style="margin-top:10px;"><span>Blocked Users</span></div>
+                <div id="blocked-users-list" class="social-scroll-list social-scroll-compact">
+                    <div class="social-empty-state">No blocked users.</div>
+                </div>
+            </div>
+
+            <!-- TAB 3: DIRECT MESSAGES (INBOX + CHAT) -->
+            <div id="social-pane-dms" class="social-tab-pane hidden-element">
+                <div id="dm-threads-view" class="dm-view-stack">
+                    <div class="social-subhead"><span>Inbox Conversations</span></div>
+                    <div id="dm-threads-list" class="social-scroll-list">
+                        <div class="social-empty-state">No messages yet. Click 💬 on any friend to start chatting.</div>
+                    </div>
+                </div>
+
+                <div id="dm-chat-view" class="dm-view-stack hidden-element">
+                    <div class="dm-chat-header">
+                        <button id="dm-chat-back" class="btn-icon-xs" title="Back to Inbox">←</button>
+                        <div class="dm-chat-partner-meta">
+                            <strong id="dm-chat-partner-name">Player</strong>
+                            <small id="dm-chat-partner-status">Online</small>
+                        </div>
+                        <button id="dm-chat-challenge-btn" class="btn-icon-xs" title="Challenge">⚔️</button>
+                    </div>
+                    <div id="dm-chat-messages" class="dm-messages-scroll"></div>
+                    <div class="dm-input-row">
+                        <input type="text" id="dm-chat-input" placeholder="Message..." maxlength="320">
+                        <button id="btn-dm-send">Send</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 4: CLUBS / GUILDS -->
+            <div id="social-pane-clubs" class="social-tab-pane hidden-element">
+                <div class="social-subhead">
+                    <span>Clubs &amp; Guilds</span>
+                    <button id="btn-open-create-club" class="btn-mini-accent">+ Create</button>
+                </div>
+                <div id="club-my-view" class="hidden-element"></div>
+                <div id="club-browse-view" class="social-scroll-list">
+                    <div class="social-empty-state">Loading clubs...</div>
+                </div>
+            </div>
+
+            <!-- TAB 5: LIVE ACTIVITY FEED & GLOBAL LEADERBOARD -->
+            <div id="social-pane-feed" class="social-tab-pane hidden-element">
+                <div class="feed-subtabs">
+                    <button id="feed-subtab-activity" class="feed-sub-btn active">⚡ Activity</button>
+                    <button id="feed-subtab-leaderboard" class="feed-sub-btn">🏆 Top ELO</button>
+                </div>
+                <div id="activity-feed-view" class="social-scroll-list">
+                    <div id="activity-feed-list">
+                        <div class="social-empty-state">No recent activity yet. Play a match!</div>
+                    </div>
+                </div>
+                <div id="leaderboard-view" class="hidden-element" style="display:flex; flex-direction:column; flex:1; min-height:0;">
+                    <select id="leaderboard-format-select" style="margin-bottom:6px; padding:5px 8px; font-size:11px;">
+                        <option value="blitz" selected>🔥 Blitz Leaderboard</option>
+                        <option value="bullet">⚡ Bullet Leaderboard</option>
+                        <option value="rapid">⏱️ Rapid Leaderboard</option>
+                    </select>
+                    <div id="leaderboard-list" class="social-scroll-list"></div>
                 </div>
             </div>
 
             <!-- Tournament Standings Box (Shown in Tourney Mode) -->
-            <div id="tourney-standings-box" class="hidden-element" style="margin-top:12px;">
+            <div id="tourney-standings-box" class="hidden-element" style="margin-top:10px;">
                 <h4>🏆 Arena Standings</h4>
                 <div id="tourney-leaderboard-list" class="tourney-leaderboard"></div>
             </div>
 
-            <button id="btn-return-menu" class="btn-danger menu-back-footer" style="margin-top:12px;">← Main Menu</button>
+            <button id="btn-return-menu" class="btn-danger menu-back-footer" style="margin-top:10px;">← Main Menu</button>
         </div>
 
         <!-- CENTER PANEL: Interactive Chess Arena -->
@@ -174,9 +453,10 @@
                     <div class="player-tag-bar opponent-metadata-identity">
                         <span class="player-avatar" id="opponent-avatar">🤖</span>
                         <div class="player-meta-stack">
-                            <div>
-                                <span id="opponent-name" class="player-username">Opponent</span>
+                            <div style="display:flex; align-items:center; gap:5px;">
+                                <span id="opponent-name" class="player-username player-inspectable" title="Click to inspect player profile">Opponent</span>
                                 <span id="opponent-rating" class="player-rating"></span>
+                                <button id="btn-quick-add-opponent" class="btn-quick-add hidden-element" title="Send Friend Request">+ Friend</button>
                             </div>
                             <div class="captured-tray">
                                 <span id="opponent-captured-pieces" class="captured-pieces"></span>
@@ -196,7 +476,7 @@
                         <span class="player-avatar">⚔️</span>
                         <div class="player-meta-stack">
                             <div>
-                                <span id="user-name" class="player-username">You</span>
+                                <span id="user-name" class="player-username player-inspectable" title="View your profile">You</span>
                                 <span id="user-rating" class="player-rating"></span>
                             </div>
                             <div class="captured-tray">
@@ -230,7 +510,7 @@
             </div>
         </div>
 
-        <!-- RIGHT PANEL: Match Setup, Move Notation & Combat Chat -->
+        <!-- RIGHT PANEL: Match Setup, Move Notation & Combat / Spectator Chat -->
         <div class="panel interaction-panel">
             <div id="match-settings-box">
                 <h3 id="mode-title-display">💰 Setup Match</h3>
@@ -315,7 +595,7 @@
                 <button id="btn-decline-draw" style="background:#b33939; color:white; padding:6px 16px;">Decline</button>
             </div>
 
-            <h3 style="margin-top:12px;">💬 Combat Comms</h3>
+            <h3 id="combat-chat-heading" style="margin-top:12px;">💬 Combat Comms</h3>
             <hr>
             <div class="chat-container">
                 <div id="chat-messages-box"></div>
@@ -363,12 +643,26 @@
             </div>
             <div style="margin-top:6px;">
                 <label for="board-theme-select">Board Surface:</label>
-                <select id="board-theme-select" style="margin-bottom:4px;">
+                <select id="board-theme-select" style="margin-bottom:8px;">
                     <option value="default">Institutional Slate / Ice</option>
                     <option value="wood">Grandmaster Walnut</option>
                     <option value="green">Tournament Emerald</option>
                 </select>
             </div>
+            <hr style="margin:8px 0;">
+            <h4 style="margin:0 0 6px 0; font-size:11px;">🛡️ Social Privacy</h4>
+            <label for="privacy-challenges-select" style="font-size:11px;">Who can challenge me:</label>
+            <select id="privacy-challenges-select" style="margin-bottom:6px; padding:6px 8px; font-size:12px;">
+                <option value="everyone">Everyone</option>
+                <option value="friends">Friends Only</option>
+                <option value="nobody">Nobody</option>
+            </select>
+            <label for="privacy-dms-select" style="font-size:11px;">Who can DM me:</label>
+            <select id="privacy-dms-select" style="margin-bottom:2px; padding:6px 8px; font-size:12px;">
+                <option value="everyone">Everyone</option>
+                <option value="friends">Friends Only</option>
+                <option value="nobody">Nobody</option>
+            </select>
         </div>
     </div>
 
@@ -382,5 +676,6 @@
     <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
     <script src="public/app.js"></script>
+    <script src="public/social.js"></script>
 </body>
 </html>

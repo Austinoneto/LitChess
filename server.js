@@ -11,6 +11,7 @@ const ethers = require('ethers');
 const { Chess } = require('chess.js');
 const fs = require('fs');
 const path = require('path');
+const { createSocialServer } = require('./social-server');
 
 // =====================================================================
 // 0. BUILT-IN .ENV AUTO-LOADER (Handles .env and Windows .env.txt)
@@ -44,7 +45,7 @@ const path = require('path');
 // =====================================================================
 // 1. BLOCKCHAIN & ORACLE CONFIGURATION
 // =====================================================================
-const RPC_URL = process.env.RPC_URL || "https://rpc.testnet.liteforge.zeeve.net";
+const RPC_URL = process.env.RPC_URL || "[https://rpc.testnet.liteforge.zeeve.net](https://rpc.testnet.liteforge.zeeve.net)";
 const CONTRACT_ADDRESS = ethers.getAddress((process.env.CONTRACT_ADDRESS || "0xB04bAF7F9784491A7041b25Bc7d3191c46Cdf73e").trim());
 const USERNAME_REGISTRY_ADDRESS = ethers.getAddress((process.env.USERNAME_REGISTRY_ADDRESS || "0x7ff44d488B5e75adF4ba35B9fbAca68ce9BE92AE").trim());
 
@@ -425,6 +426,21 @@ function broadcastToRoom(matchId, payload, excludeWs = null) {
     });
 }
 
+function broadcastToSpectators(matchId, payload, excludeWs = null) {
+    const room = rooms.get(matchId);
+    if (!room) return;
+    const serialized = JSON.stringify(payload);
+    room.clients.forEach((client) => {
+        if (
+            client !== excludeWs &&
+            client.readyState === WebSocket.OPEN &&
+            room.spectators.has(client.sessionId)
+        ) {
+            sendSafe(client, serialized);
+        }
+    });
+}
+
 function buildGameStateSnapshot(room) {
     const verboseHistory = room.chess.history({ verbose: true });
     let whiteUser = 'White';
@@ -454,8 +470,7 @@ function buildGameStateSnapshot(room) {
 }
 
 /**
- * Synchronizes opponent usernames, colors, and Elo ratings across both players in a room.
- * Sends the opponent's sessionId (oppSid) so the client's `fromClientId !== mySessionId` guard passes.
+ * Synchronizes opponent usernames, colors, wallets, and Elo ratings across both players in a room.
  */
 function syncRoomPlayerIdentities(room) {
     if (!room) return;
@@ -468,6 +483,7 @@ function syncRoomPlayerIdentities(room) {
                     type: 'USER_INFO',
                     fromClientId: oppSid,
                     username: opp.username,
+                    wallet: opp.wallet || null,
                     color: opp.color,
                     ratings: opp.wallet ? getRatingsObject(opp.wallet) : { bullet: 2000, blitz: 2000, rapid: 2000 }
                 });
@@ -477,13 +493,75 @@ function syncRoomPlayerIdentities(room) {
 }
 
 // =====================================================================
+// 3B. SOCIAL SERVER ENGINE HOOKUP
+// =====================================================================
+function createRoomInstance(matchId, overrides = {}) {
+    return {
+        matchId,
+        clients: new Set(),
+        players: new Map(),
+        spectators: new Set(),
+        chess: new Chess(),
+        idleTime: 0,
+        txPending: false,
+        isPaidMode: false,
+        isFreeMode: false,
+        onChainVerified: false,
+        challengePendingOpponent: false,
+        whiteWallet: null,
+        blackWallet: null,
+        wagerEth: 0,
+        whiteTime: 180,
+        blackTime: 180,
+        inc: 2,
+        lastTick: Date.now(),
+        openingTimerStart: null,
+        nonces: new Map(),
+        drawOfferFrom: null,
+        timeControlName: 'blitz',
+        gameEnded: false,
+        createdAt: Date.now(),
+        ...overrides
+    };
+}
+
+const social = createSocialServer({
+    rooms,
+    playerRatings,
+    usernameToAddress,
+    ensurePlayerRecord,
+    getRatingsObject,
+    fetchUsername,
+    sendSafe,
+    RESTRICTED_WORDS,
+    createDirectFreeRoom: ({ whiteWallet, blackWallet, timeControl }) => {
+        evictCompletedRoomsIfNeeded();
+        const tcCfg = tcMap[timeControl] || tcMap.blitz;
+        const matchId = "0x" + crypto.randomBytes(32).toString('hex');
+        const room = createRoomInstance(matchId, {
+            isPaidMode: false,
+            isFreeMode: true,
+            whiteTime: tcCfg.time,
+            blackTime: tcCfg.time,
+            inc: tcCfg.inc,
+            timeControlName: timeControl || 'blitz',
+            whiteWallet: whiteWallet || null,
+            blackWallet: blackWallet || null,
+            openingTimerStart: null
+        });
+        rooms.set(matchId, room);
+        return matchId;
+    }
+});
+
+// =====================================================================
 // 4. ELO RATING & MATCH STATISTICS ENGINE
 // =====================================================================
 async function updateRatingsAfterGame(whiteWallet, blackWallet, winnerWallet, room) {
     totalGamesPlayedCount++;
     if (!whiteWallet || !blackWallet) {
         await saveRatings();
-        return;
+        return null;
     }
     const cleanWhite = whiteWallet.toLowerCase();
     const cleanBlack = blackWallet.toLowerCase();
@@ -535,6 +613,35 @@ async function updateRatingsAfterGame(whiteWallet, blackWallet, winnerWallet, ro
             });
         }
     }
+
+    return { oldWhite: R_white, newWhite, oldBlack: R_black, newBlack };
+}
+
+function recordRoomOutcomeToSocial(room, matchId, winnerColor, winnerWallet, reason, ratingDelta = null) {
+    try {
+        const snap = buildGameStateSnapshot(room);
+        social.recordMatchCompleted({
+            matchId,
+            whiteWallet: room.whiteWallet,
+            blackWallet: room.blackWallet,
+            whiteUsername: snap.whiteUsername,
+            blackUsername: snap.blackUsername,
+            winnerWallet,
+            winnerColor,
+            reason,
+            timeControl: room.timeControlName,
+            isPaid: room.isPaidMode,
+            wagerEth: room.wagerEth || 0,
+            pgn: typeof room.chess.pgn === 'function' ? room.chess.pgn() : '',
+            moveCount: room.chess.history().length,
+            oldWhiteRating: ratingDelta ? ratingDelta.oldWhite : null,
+            newWhiteRating: ratingDelta ? ratingDelta.newWhite : null,
+            oldBlackRating: ratingDelta ? ratingDelta.oldBlack : null,
+            newBlackRating: ratingDelta ? ratingDelta.newBlack : null
+        });
+    } catch (e) {
+        console.warn('[SOCIAL] Failed to record match history:', e.message);
+    }
 }
 
 // =====================================================================
@@ -548,8 +655,8 @@ class TransactionRelayer {
         this.localNonce = null;
     }
 
-    enqueueResolve(matchId, winnerWallet, room) {
-        this.queue.push({ action: 'RESOLVE', matchId, winnerWallet, room });
+    enqueueResolve(matchId, winnerWallet, room, winnerColor = null, reason = 'completed') {
+        this.queue.push({ action: 'RESOLVE', matchId, winnerWallet, room, winnerColor, reason });
         this.processQueue();
     }
 
@@ -568,7 +675,7 @@ class TransactionRelayer {
         this.isProcessing = true;
 
         const job = this.queue.shift();
-        const { action, matchId, winnerWallet, room, tourney } = job;
+        const { action, matchId, winnerWallet, room, tourney, winnerColor, reason } = job;
         const cleanMatchId = ensureBytes32(matchId);
         const maxRetries = 3;
         let attempt = 0;
@@ -647,7 +754,8 @@ class TransactionRelayer {
                         winnerWallet: winnerWallet || ethers.ZeroAddress
                     });
                     if (room && room.isPaidMode && room.whiteWallet && room.blackWallet) {
-                        await updateRatingsAfterGame(room.whiteWallet, room.blackWallet, winnerWallet || ethers.ZeroAddress, room);
+                        const delta = await updateRatingsAfterGame(room.whiteWallet, room.blackWallet, winnerWallet || ethers.ZeroAddress, room);
+                        recordRoomOutcomeToSocial(room, matchId, winnerColor, winnerWallet || ethers.ZeroAddress, reason, delta);
                     }
                 }
                 break;
@@ -693,6 +801,10 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
                 const blackWallet = (matchData.playerBlack || "").toLowerCase();
                 const tcConfig = getTimeControlFromIndex(matchData.timeControl);
 
+                if (matchData.wagerAmount) {
+                    room.wagerEth = Number(ethers.formatEther(matchData.wagerAmount));
+                }
+
                 if (room.chess.history().length === 0) {
                     room.whiteTime = tcConfig.time;
                     room.blackTime = tcConfig.time;
@@ -714,7 +826,7 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
                     room.onChainVerified = true;
                     room.lastTick = Date.now();
 
-                    console.log(`[ORACLE] Room verified on-chain – White: ${room.whiteWallet} | Black: ${room.blackWallet}`);
+                    console.log(`[ORACLE] Room verified on-chain – White: ${room.whiteWallet} | Black: ${room.blackWallet} | Wager: ${room.wagerEth} zkLTC`);
 
                     for (const [, p] of room.players) {
                         if (p.authenticated && (p.wallet === whiteWallet || p.wallet === blackWallet)) {
@@ -729,6 +841,8 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
                     }
                     broadcastToRoom(matchId, buildGameStateSnapshot(room));
                     syncRoomPlayerIdentities(room);
+                    social.notifyPresenceChange(whiteWallet);
+                    social.notifyPresenceChange(blackWallet);
                     room._verifyingOnChain = false;
                     return true;
                 }
@@ -764,6 +878,9 @@ function abortRoomAndRefund(room, matchId, reason = 'opening_timeout') {
     } else {
         broadcastToRoom(matchId, { type: 'MATCH_ABORTED' });
     }
+
+    if (room.whiteWallet) social.notifyPresenceChange(room.whiteWallet);
+    if (room.blackWallet) social.notifyPresenceChange(room.blackWallet);
 }
 
 function finalizeGameEnd(room, matchId, winnerColor, reason) {
@@ -776,9 +893,11 @@ function finalizeGameEnd(room, matchId, winnerColor, reason) {
 
     if (room.isPaidMode) {
         room.txPending = true;
-        relayer.enqueueResolve(matchId, winnerWallet, room);
+        relayer.enqueueResolve(matchId, winnerWallet, room, winnerColor, reason);
     } else {
-        updateRatingsAfterGame(room.whiteWallet, room.blackWallet, winnerWallet, room);
+        updateRatingsAfterGame(room.whiteWallet, room.blackWallet, winnerWallet, room).then((delta) => {
+            recordRoomOutcomeToSocial(room, matchId, winnerColor, winnerWallet, reason, delta);
+        });
     }
 
     if (room.tourneyId && tournaments.has(room.tourneyId)) {
@@ -949,6 +1068,7 @@ function recordTournamentResult(tourneyId, whiteWallet, blackWallet, winnerColor
         if (t.isPaid && ethers.isAddress(championWallet)) {
             relayer.enqueueTourneyResolve(tourneyId, championWallet, t);
         }
+        social.emitActivityEvent(championWallet, 'tournament', `won Tournament Arena "${t.name}"! 🏆`);
         broadcastTournamentUpdate(tourneyId);
         return;
     }
@@ -1008,36 +1128,9 @@ function pairAvailableTournamentPlayers(tourneyId) {
 
         sendSafe(p1.ws, { type: 'FREE_MATCH_FOUND', matchId, color: 'w', tourneyId, sessionId: p1.ws.sessionId, opponentName: p2.username });
         sendSafe(p2.ws, { type: 'FREE_MATCH_FOUND', matchId, color: 'b', tourneyId, sessionId: p2.ws.sessionId, opponentName: p1.username });
+        social.notifyPresenceChange(p1.wallet);
+        social.notifyPresenceChange(p2.wallet);
     }
-}
-
-function createRoomInstance(matchId, overrides = {}) {
-    return {
-        matchId,
-        clients: new Set(),
-        players: new Map(),
-        spectators: new Set(),
-        chess: new Chess(),
-        idleTime: 0,
-        txPending: false,
-        isPaidMode: false,
-        isFreeMode: false,
-        onChainVerified: false,
-        challengePendingOpponent: false,
-        whiteWallet: null,
-        blackWallet: null,
-        whiteTime: 180,
-        blackTime: 180,
-        inc: 2,
-        lastTick: Date.now(),
-        openingTimerStart: null,
-        nonces: new Map(),
-        drawOfferFrom: null,
-        timeControlName: 'blitz',
-        gameEnded: false,
-        createdAt: Date.now(),
-        ...overrides
-    };
 }
 
 // =====================================================================
@@ -1059,6 +1152,9 @@ server.on('connection', (ws, req) => {
 
     let currentMatchId = null;
 
+    // Initialize social handshake nonce on every connection
+    social.onConnect(ws);
+
     sendSafe(ws, {
         type: 'LOBBY_TELEMETRY',
         totalGames: totalGamesPlayedCount,
@@ -1079,6 +1175,11 @@ server.on('connection', (ws, req) => {
             const { type } = message;
 
             if (type === 'SOLO_RESULT') {
+                return;
+            }
+
+            // Route all social, presence, DM, club & direct challenge messages to social-server.js
+            if (await social.handleMessage(ws, message)) {
                 return;
             }
 
@@ -1109,7 +1210,7 @@ server.on('connection', (ws, req) => {
                 return;
             }
 
-            // ---------- PLAYER SEARCH ----------
+            // ---------- LEGACY SINGLE-RESULT PLAYER SEARCH (Kept backward-compatible, fixed false positives) ----------
             if (type === 'SEARCH_USER') {
                 const query = String(message.query || '').trim().toLowerCase();
                 if (!query) return;
@@ -1143,18 +1244,29 @@ server.on('connection', (ws, req) => {
                     }
                 });
 
-                const ratings = matchedAddr ? getRatingsObject(matchedAddr) : { bullet: 2000, blitz: 2000, rapid: 2000, gamesPlayed: 0, wins: 0 };
-                const resolvedName = matchedAddr ? await fetchUsername(matchedAddr) : query;
+                if (!matchedAddr) {
+                    sendSafe(ws, {
+                        type: 'SEARCH_USER_RESULT',
+                        query: message.query,
+                        found: false
+                    });
+                    return;
+                }
+
+                const presence = social.computePresence(matchedAddr);
+                const ratings = getRatingsObject(matchedAddr);
+                const resolvedName = await fetchUsername(matchedAddr);
 
                 sendSafe(ws, {
                     type: 'SEARCH_USER_RESULT',
                     query: message.query,
                     found: true,
                     username: resolvedName,
-                    wallet: matchedAddr || null,
+                    wallet: matchedAddr,
                     ratings,
-                    isOnline,
-                    activeMatchId: activeRoomId
+                    isOnline: isOnline || presence.status !== 'offline',
+                    presence,
+                    activeMatchId: activeRoomId || presence.activeMatchId
                 });
                 return;
             }
@@ -1206,6 +1318,9 @@ server.on('connection', (ws, req) => {
 
                 if (!t.players.has(wallet)) {
                     t.players.set(wallet, { ws, username, points: 0, wins: 0, games: 0, inMatch: false });
+                    if (ethers.isAddress(wallet)) {
+                        social.emitActivityEvent(wallet, 'tournament', `entered Tournament Arena "${t.name}"`);
+                    }
                 } else {
                     const existing = t.players.get(wallet);
                     existing.ws = ws;
@@ -1316,6 +1431,9 @@ server.on('connection', (ws, req) => {
                         timeControl,
                         opponentName: p1.username
                     });
+
+                    if (p1.wallet) social.notifyPresenceChange(p1.wallet);
+                    if (p2.wallet) social.notifyPresenceChange(p2.wallet);
                 }
                 return;
             }
@@ -1370,7 +1488,8 @@ server.on('connection', (ws, req) => {
 
                 if (spectate) {
                     room.spectators.add(ws.sessionId);
-                    sendSafe(ws, { type: 'SPECTATOR_MODE', matchId });
+                    ws._spectatorName = clientUsername || (clientWallet ? social.getDisplayName(clientWallet) : ("Railbird_" + ws.sessionId.slice(0, 4)));
+                    sendSafe(ws, { type: 'SPECTATOR_MODE', matchId, sessionId: ws.sessionId });
                     sendSafe(ws, buildGameStateSnapshot(room));
                     return;
                 }
@@ -1393,7 +1512,8 @@ server.on('connection', (ws, req) => {
                         clientWallet !== room.blackWallet
                     ) {
                         room.spectators.add(ws.sessionId);
-                        sendSafe(ws, { type: 'SPECTATOR_MODE', matchId });
+                        ws._spectatorName = clientUsername || social.getDisplayName(clientWallet);
+                        sendSafe(ws, { type: 'SPECTATOR_MODE', matchId, sessionId: ws.sessionId });
                         sendSafe(ws, buildGameStateSnapshot(room));
                         return;
                     }
@@ -1463,7 +1583,8 @@ server.on('connection', (ws, req) => {
 
                 if (!existingPlayer && room.players.size >= 2) {
                     room.spectators.add(ws.sessionId);
-                    sendSafe(ws, { type: 'SPECTATOR_MODE', matchId });
+                    ws._spectatorName = clientUsername || (clientWallet ? social.getDisplayName(clientWallet) : ("Railbird_" + ws.sessionId.slice(0, 4)));
+                    sendSafe(ws, { type: 'SPECTATOR_MODE', matchId, sessionId: ws.sessionId });
                     sendSafe(ws, buildGameStateSnapshot(room));
                     return;
                 }
@@ -1471,6 +1592,8 @@ server.on('connection', (ws, req) => {
                 if (!existingPlayer) {
                     const takenColors = [...room.players.values()].map(p => p.color);
                     let assignedColor = color;
+                    if (clientWallet && room.whiteWallet && clientWallet === room.whiteWallet) assignedColor = 'w';
+                    else if (clientWallet && room.blackWallet && clientWallet === room.blackWallet) assignedColor = 'b';
                     if (!assignedColor || takenColors.includes(assignedColor)) {
                         assignedColor = takenColors.includes('w') ? 'b' : 'w';
                     }
@@ -1493,6 +1616,10 @@ server.on('connection', (ws, req) => {
                 }
 
                 const myPlayer = room.players.get(ws.sessionId);
+                if (myPlayer.wallet) {
+                    if (myPlayer.color === 'w' && !room.whiteWallet) room.whiteWallet = myPlayer.wallet;
+                    if (myPlayer.color === 'b' && !room.blackWallet) room.blackWallet = myPlayer.wallet;
+                }
 
                 if (room.players.size === 2 && !room.openingTimerStart) {
                     room.openingTimerStart = Date.now();
@@ -1513,6 +1640,7 @@ server.on('connection', (ws, req) => {
                     broadcastToRoom(matchId, { type: 'OPPONENT_JOINED' }, ws);
                     syncRoomPlayerIdentities(room);
                 }
+                if (myPlayer.wallet) social.notifyPresenceChange(myPlayer.wallet);
                 return;
             }
 
@@ -1592,7 +1720,8 @@ server.on('connection', (ws, req) => {
                         if (recovered !== room.whiteWallet && recovered !== room.blackWallet) {
                             room.players.delete(ws.sessionId);
                             room.spectators.add(ws.sessionId);
-                            sendSafe(ws, { type: 'SPECTATOR_MODE', matchId: currentMatchId });
+                            ws._spectatorName = await fetchUsername(recovered);
+                            sendSafe(ws, { type: 'SPECTATOR_MODE', matchId: currentMatchId, sessionId: ws.sessionId });
                             sendSafe(ws, buildGameStateSnapshot(room));
                             return;
                         }
@@ -1683,6 +1812,7 @@ server.on('connection', (ws, req) => {
                     }
 
                     syncRoomPlayerIdentities(room);
+                    social.notifyPresenceChange(recovered);
                 } catch (e) {
                     console.error('[SET_WALLET] Error:', e.message);
                     sendSafe(ws, { type: 'ERROR', reason: 'Authentication failure.' });
@@ -1845,6 +1975,29 @@ server.on('connection', (ws, req) => {
                 return;
             }
 
+            // ---------- SPECTATOR LOUNGE / RAILBIRD CHAT (Isolated from players!) ----------
+            if (type === 'SPECTATOR_CHAT') {
+                if (!currentMatchId) return;
+                const room = rooms.get(currentMatchId);
+                if (!room || !room.spectators.has(ws.sessionId)) return;
+
+                const cleanText = String(message.text || '').trim();
+                if (!cleanText) return;
+                if (RESTRICTED_WORDS.some(w => cleanText.toLowerCase().includes(w))) {
+                    sendSafe(ws, { type: 'ERROR', reason: 'Message blocked by server moderation.' });
+                    return;
+                }
+
+                const senderName = ws._spectatorName || String(message.sender || 'Spectator').slice(0, 24);
+                broadcastToSpectators(currentMatchId, {
+                    type: 'RECEIVE_SPECTATOR_CHAT',
+                    fromClientId: ws.sessionId,
+                    sender: senderName,
+                    text: cleanText.slice(0, 200)
+                }, ws);
+                return;
+            }
+
             // ---------- CHAT & REMATCH ----------
             if (['CHAT_MESSAGE', 'REMATCH_OFFER', 'REMATCH_RESPONSE'].includes(type)) {
                 if (!currentMatchId) return;
@@ -1885,6 +2038,9 @@ server.on('connection', (ws, req) => {
         if (ws.sessionId) {
             clientMessageCounts.delete(ws.sessionId);
         }
+
+        // Clean up social presence on disconnect
+        social.onDisconnect(ws);
 
         for (const tc of Object.keys(freeQueues)) {
             freeQueues[tc] = freeQueues[tc].filter(entry => entry.ws !== ws);
