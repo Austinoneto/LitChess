@@ -655,8 +655,6 @@ function applyPieceTheme(theme) {
     if (board) {
         const activeChess = isAnalysisMode ? analysisGame : game;
         const currentFen = activeChess.fen();
-        const savedFrom = lastMoveFrom;
-        const savedTo = lastMoveTo;
 
         board.clear(false);
         board.position(currentFen, false);
@@ -665,11 +663,7 @@ function applyPieceTheme(theme) {
             if (p) $(this).attr('src', getPieceThemeUrl(p));
         });
 
-        if (savedFrom && savedTo) {
-            highlightLastMove(savedFrom, savedTo);
-        }
-        renderPremoveHighlights();
-        updateCheckHighlight();
+        reapplyBoardHighlights();
     }
 }
 
@@ -743,14 +737,14 @@ function updateCapturedPiecesAndMaterial() {
 }
 
 // ============================================================================
-// 6. HIGHLIGHTS, CLICK-TO-MOVE, CHECK GLOW, PREMOVES & PROMOTIONS
+// 6. HIGHLIGHTS, CLICK/TAP-AND-DROP, CHECK GLOW, PREMOVES & PROMOTIONS
 // ============================================================================
 var lastMoveFrom = null;
 var lastMoveTo = null;
 
 function clearSquareSelection() {
     selectedSquare = null;
-    $('.square-55d63').removeClass('square-selected square-legal-move square-legal-capture');
+    $('.square-55d63').removeClass('square-selected square-selected-premove square-legal-move square-legal-capture');
 }
 
 function clearMoveHighlights() {
@@ -815,6 +809,18 @@ function updateCheckHighlight() {
     }
 }
 
+function reapplyBoardHighlights() {
+    if (lastMoveFrom && lastMoveTo) {
+        $(`.square-${lastMoveFrom}`).addClass('square-highlight-from');
+        $(`.square-${lastMoveTo}`).addClass('square-highlight-to');
+    }
+    renderPremoveHighlights();
+    updateCheckHighlight();
+    if (selectedSquare) {
+        selectSquareAndHighlightTargets(selectedSquare);
+    }
+}
+
 function flashCheckmatedKing() {
     updateCheckHighlight();
 }
@@ -826,7 +832,7 @@ function showPromotionSelector(color, callback) {
     $('#promo-rook').attr('src', getPieceThemeUrl(`${color}R`));
     $('#promo-bishop').attr('src', getPieceThemeUrl(`${color}B`));
     $('#promo-knight').attr('src', getPieceThemeUrl(`${color}N`));
-    selector.removeClass('hidden-element').css('display', 'flex');
+    selector.removeClass('hidden-element');
     pendingPromotion = { callback };
 }
 
@@ -1077,12 +1083,14 @@ botWorker.onmessage = function (e) {
         if (move) {
             const applied = game.move(move);
             if (applied) {
+                clearSquareSelection();
                 highlightLastMove(applied.from, applied.to);
                 board.position(game.fen());
                 updateCheckHighlight();
                 updateCapturedPiecesAndMaterial();
                 renderLiveMoveNotation();
                 EventBus.emit('moveMade', { captured: !!applied.captured });
+                if (applied.flags && (applied.flags.includes('k') || applied.flags.includes('q'))) EventBus.emit('castle');
                 if (applied.promotion) EventBus.emit('promotion');
             }
         }
@@ -1182,12 +1190,12 @@ function restoreGameState() {
         $('#arena-app-wrapper').removeClass('hidden-element');
 
         if (board === null) initChessboard();
-        else board.position(game.fen());
+        else board.position(game.fen(), false);
 
         board.orientation(myAssignedColor === 'b' ? 'black' : 'white');
         updateProfileRatingsDisplay();
         updateCapturedPiecesAndMaterial();
-        updateCheckHighlight();
+        reapplyBoardHighlights();
         renderLiveMoveNotation();
         updateFloatingControls();
 
@@ -1330,7 +1338,6 @@ function checkForChallengeLink() {
     const hashAnchor = window.location.hash;
     const ephemeralPrivateKey = (hashAnchor && hashAnchor.startsWith('#')) ? hashAnchor.substring(1) : null;
 
-    // Clean the URL bar immediately so refreshes or subsequent games never re-trigger an expired challenge link
     clearChallengeQueryFromUrl();
 
     $('#arena-app-wrapper').removeClass('hidden-element');
@@ -1395,6 +1402,7 @@ function spectateMatchById(matchId) {
     $('#arena-app-wrapper').removeClass('hidden-element');
     if (board === null) initChessboard();
     board.orientation('white');
+    reapplyBoardHighlights();
     updateFloatingControls();
 
     if (p2pSocket && p2pSocket.readyState !== WebSocket.CLOSED) p2pSocket.close();
@@ -1414,7 +1422,10 @@ function spectateMatchById(matchId) {
 function enterSpectatorMode() {
     isSpectator = true;
     myAssignedColor = 'w';
-    if (board) board.orientation('white');
+    if (board) {
+        board.orientation('white');
+        reapplyBoardHighlights();
+    }
     $('#spectator-banner').removeClass('hidden-element');
     $('#match-settings-box').addClass('hidden-element');
     $('#analysis-moves-panel').removeClass('hidden-element');
@@ -1814,6 +1825,7 @@ function initiateFreeMatchmaking(overrideSidePref = null) {
                 $('#btn-find-match').removeClass('hidden-element').prop('disabled', true).text("Match in Progress");
 
                 board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
+                reapplyBoardHighlights();
 
                 p2pSocket.send(JSON.stringify({
                     type: 'JOIN_ROOM',
@@ -1899,6 +1911,7 @@ async function initiateTournamentJoin() {
                     updateProfileRatingsDisplay();
                 }
                 board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
+                reapplyBoardHighlights();
                 p2pSocket.send(JSON.stringify({
                     type: 'JOIN_ROOM',
                     matchId: activeMatchId,
@@ -2036,7 +2049,8 @@ function handleStandardP2PMessage(data, isRestored = false) {
     if (data.type === 'MOVE_ERROR') {
         showToast("Illegal move: " + data.reason, "error");
         game.undo();
-        board.position(game.fen());
+        board.position(game.fen(), false);
+        clearSquareSelection();
         updateCheckHighlight();
         updateCapturedPiecesAndMaterial();
         renderLiveMoveNotation();
@@ -2114,6 +2128,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
             isAnalysisMode = false;
             $('#spectator-banner').addClass('hidden-element');
             board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
+            reapplyBoardHighlights();
             setChatEnabled(true);
             isMatchActive = true;
             $('#match-settings-box').addClass('hidden-element');
@@ -2182,7 +2197,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
                     game.move({ from: m.from, to: m.to, promotion: m.promotion || 'q' });
                 }
                 if (!isAnalysisMode) {
-                    board.position(game.fen());
+                    board.position(game.fen(), false);
                 }
                 if (data.moves.length > 0) {
                     const lm = game.history({ verbose: true }).pop();
@@ -2232,6 +2247,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
             if (data.color && data.color !== myAssignedColor) {
                 myAssignedColor = data.color;
                 board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
+                reapplyBoardHighlights();
             }
             if (data.username && !isSpectator) myUsername = data.username;
             isAuthenticated = true;
@@ -2340,7 +2356,8 @@ function handleStandardP2PMessage(data, isRestored = false) {
                 updateCheckHighlight();
                 updateCapturedPiecesAndMaterial();
                 renderLiveMoveNotation();
-                EventBus.emit('moveMade', { captured });
+                EventBus.emit('moveMade', { captured: captured || !!(oppMove.flags && oppMove.flags.includes('e')) });
+                if (oppMove.flags && (oppMove.flags.includes('k') || oppMove.flags.includes('q'))) EventBus.emit('castle');
                 if (oppMove.promotion) EventBus.emit('promotion');
 
                 if (game.history().length < 2) startInitialAbortTimer();
@@ -2386,7 +2403,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
 }
 
 // ============================================================================
-// 15. CHESSBOARD INTERACTION, CLICK-TO-MOVE, VARIATION BOARD & PREMOVES
+// 15. PURE CLICK / TAP-AND-DROP BOARD ENGINE, VARIATION BOARD & PREMOVES
 // ============================================================================
 function canPremove() {
     return currentMode !== 'solo' && isMatchActive && !gameResultSettled && isAuthenticated &&
@@ -2406,7 +2423,7 @@ function executePremoves() {
         }
         clearSquareSelection();
         highlightLastMove(pm.from, pm.to);
-        board.position(game.fen());
+        board.position(game.fen(), false);
         updateCheckHighlight();
         updateCapturedPiecesAndMaterial();
         renderLiveMoveNotation();
@@ -2420,6 +2437,7 @@ function executePremoves() {
             }));
         }
         EventBus.emit('moveMade', { captured: !!move.captured, isPremove: true });
+        if (move.flags && (move.flags.includes('k') || move.flags.includes('q'))) EventBus.emit('castle');
         if (move.promotion) EventBus.emit('promotion');
         if (game.history().length >= 2) clearTimeout(openingMoveTimer);
         updateLifecycleButtons();
@@ -2435,11 +2453,13 @@ function executePremoves() {
 function selectSquareAndHighlightTargets(square) {
     clearSquareSelection();
     selectedSquare = square;
-    $(`.square-${square}`).addClass('square-selected');
 
     if (canPremove()) {
+        $(`.square-${square}`).addClass('square-selected square-selected-premove');
         return;
     }
+
+    $(`.square-${square}`).addClass('square-selected');
 
     const activeChess = isAnalysisMode ? analysisGame : game;
     const legalMoves = activeChess.moves({ square: square, verbose: true });
@@ -2453,100 +2473,6 @@ function selectSquareAndHighlightTargets(square) {
 }
 
 function initChessboard() {
-    function onDragStart(source, piece) {
-        clearSquareSelection();
-
-        // Allow free piece dragging in post-game variation analysis mode
-        if (isAnalysisMode && gameResultSettled) {
-            if (analysisGame.game_over()) return false;
-            if ((analysisGame.turn() === 'w' && piece.search(/^b/) !== -1) ||
-                (analysisGame.turn() === 'b' && piece.search(/^w/) !== -1)) return false;
-            selectSquareAndHighlightTargets(source);
-            return !pendingPromotion;
-        }
-
-        if (canPremove() && !game.game_over()) {
-            if ((myAssignedColor === 'w' && piece.search(/^b/) !== -1) ||
-                (myAssignedColor === 'b' && piece.search(/^w/) !== -1)) return false;
-            return !pendingPromotion;
-        }
-
-        if (isPaidMode && !isAuthenticated) {
-            showToast("Verifying cryptographic session...", "warn");
-            return false;
-        }
-        if (!isMatchActive || game.game_over() || gameResultSettled || isSpectator) return false;
-        if (currentMode === 'solo' && isBotThinking) return false;
-        if ((myAssignedColor === 'w' && piece.search(/^b/) !== -1) ||
-            (myAssignedColor === 'b' && piece.search(/^w/) !== -1)) return false;
-        if ((game.turn() === 'w' && piece.search(/^b/) !== -1) ||
-            (game.turn() === 'b' && piece.search(/^w/) !== -1)) return false;
-
-        selectSquareAndHighlightTargets(source);
-        return !pendingPromotion;
-    }
-
-    function onDrop(source, target) {
-        clearSquareSelection();
-        if (source === target) return 'snapback';
-
-        // Handle post-game variation analysis moves
-        if (isAnalysisMode && gameResultSettled) {
-            const piece = analysisGame.get(source);
-            if (!piece) return 'snapback';
-            if (piece.type === 'p') {
-                const promotionRank = (piece.color === 'w') ? '8' : '1';
-                if (target[1] === promotionRank) {
-                    const testMoves = analysisGame.moves({ square: source, verbose: true });
-                    if (!testMoves.some(m => m.to === target)) return 'snapback';
-                    showPromotionSelector(piece.color, function (chosenPiece) {
-                        hidePromotionSelector();
-                        executeAnalysisVariationMove(source, target, chosenPiece);
-                    });
-                    return 'snapback';
-                }
-            }
-            if (!executeAnalysisVariationMove(source, target, 'q')) return 'snapback';
-            return;
-        }
-
-        if (canPremove()) {
-            var piece = game.get(source);
-            if (piece && piece.type === 'p') {
-                var promotionRank = (piece.color === 'w') ? '8' : '1';
-                if (target[1] === promotionRank) {
-                    showPromotionSelector(piece.color, function (chosenPiece) {
-                        hidePromotionSelector();
-                        pendingPremoves = [{ from: source, to: target, promotion: chosenPiece }];
-                        renderPremoveHighlights();
-                    });
-                    return 'snapback';
-                }
-            }
-            pendingPremoves = [{ from: source, to: target, promotion: 'q' }];
-            renderPremoveHighlights();
-            return 'snapback';
-        }
-
-        if (!isMatchActive || pendingPromotion) return 'snapback';
-
-        var piece = game.get(source);
-        if (piece && piece.type === 'p') {
-            var promotionRank = (piece.color === 'w') ? '8' : '1';
-            if (target[1] === promotionRank) {
-                var testMoves = game.moves({ square: source, verbose: true });
-                if (!testMoves.some(m => m.to === target)) return 'snapback';
-                showPromotionSelector(piece.color, function (chosenPiece) {
-                    hidePromotionSelector();
-                    executeMove(source, target, chosenPiece);
-                });
-                return 'snapback';
-            }
-        }
-
-        if (!executeMove(source, target, 'q')) return 'snapback';
-    }
-
     function executeAnalysisVariationMove(source, target, promotion) {
         const move = analysisGame.move({ from: source, to: target, promotion: promotion });
         if (!move) {
@@ -2555,11 +2481,13 @@ function initChessboard() {
         }
         clearSquareSelection();
         highlightLastMove(source, target);
-        board.position(analysisGame.fen(), false);
+        board.position(analysisGame.fen());
         updateCheckHighlight();
         updateCapturedPiecesAndMaterial();
         calculateSimulatedEvaluation(analysisGame.fen());
         EventBus.emit('moveMade', { captured: !!move.captured });
+        if (move.flags && (move.flags.includes('k') || move.flags.includes('q'))) EventBus.emit('castle');
+        if (move.promotion) EventBus.emit('promotion');
         if (analysisGame.in_check()) EventBus.emit('check');
         return true;
     }
@@ -2591,7 +2519,7 @@ function initChessboard() {
             }
         }
 
-        board.position(game.fen(), false);
+        board.position(game.fen());
 
         if (currentMode === 'solo') {
             runChessClockEngine();
@@ -2621,22 +2549,26 @@ function initChessboard() {
         return true;
     }
 
+    // Pure Click/Tap-and-Drop Configuration (Dragging completely disabled)
     board = ChessBoard('myBoard', {
-        draggable: true,
+        draggable: false,
         position: 'start',
-        onDragStart: onDragStart,
-        onDrop: onDrop,
+        moveSpeed: 120,
         pieceTheme: getPieceThemeUrl
     });
 
-    // Hybrid Click-to-Move, Click-to-Premove & Legal Target Dots Handler
+    // Unified Click & Mobile Tap Handler (Select Piece -> Show Valid Targets -> Tap Target to Drop)
     $('#myBoard').off('click', '.square-55d63').on('click', '.square-55d63', function () {
         if (pendingPromotion) return;
         const clickedSq = $(this).attr('data-square');
         if (!clickedSq) return;
 
-        // Post-game variation board click-to-move
+        // 1. Post-game interactive variation analysis mode
         if (isAnalysisMode && gameResultSettled) {
+            if (analysisGame.game_over()) {
+                clearSquareSelection();
+                return;
+            }
             if (selectedSquare && selectedSquare !== clickedSq) {
                 const legalMoves = analysisGame.moves({ square: selectedSquare, verbose: true });
                 if (legalMoves.some(m => m.to === clickedSq)) {
@@ -2665,11 +2597,19 @@ function initChessboard() {
             return;
         }
 
-        if (!isMatchActive || gameResultSettled || isSpectator) return;
-        if (isPaidMode && !isAuthenticated) return;
+        // 2. Guard checks for live play
+        if (!isMatchActive || gameResultSettled || isSpectator || game.game_over()) {
+            clearSquareSelection();
+            return;
+        }
+        if (isPaidMode && !isAuthenticated) {
+            showToast("Verifying cryptographic session...", "warn");
+            clearSquareSelection();
+            return;
+        }
         if (currentMode === 'solo' && isBotThinking) return;
 
-        // Click-to-Premove when it is opponent's turn
+        // 3. Tap/Click-to-Premove when it is opponent's turn
         if (canPremove()) {
             if (selectedSquare && selectedSquare !== clickedSq) {
                 const fromSq = selectedSquare;
@@ -2700,9 +2640,13 @@ function initChessboard() {
             return;
         }
 
-        // Standard Click-to-Move on player's turn
-        if (game.turn() !== myAssignedColor) return;
+        // 4. Standard Click/Tap-and-Drop on player's turn
+        if (game.turn() !== myAssignedColor) {
+            clearSquareSelection();
+            return;
+        }
 
+        // If a piece is already selected, check if clicked square is a valid drop target
         if (selectedSquare && selectedSquare !== clickedSq) {
             const legalMoves = game.moves({ square: selectedSquare, verbose: true });
             if (legalMoves.some(m => m.to === clickedSq)) {
@@ -2724,6 +2668,7 @@ function initChessboard() {
             }
         }
 
+        // Otherwise, select or deselect player's own piece
         const sqPiece = game.get(clickedSq);
         if (sqPiece && sqPiece.color === myAssignedColor) {
             if (selectedSquare === clickedSq) clearSquareSelection();
@@ -2991,7 +2936,7 @@ function resetMatchEnvironment() {
     if (p2pSocket) { p2pSocket.close(); p2pSocket = null; }
     game.reset();
     analysisGame.reset();
-    if (board) { board.start(); board.orientation('white'); }
+    if (board) { board.start(false); board.orientation('white'); }
     analysisMovesList = [];
     analysisCurrentIndex = -1;
     gameResultSettled = false;
@@ -3114,7 +3059,7 @@ function setupAnalysisNavigation() {
 
         renderLiveMoveNotation();
         calculateSimulatedEvaluation(analysisGame.fen());
-        showToast("Interactive Analysis active: drag or click pieces to test variations!", "info", 3500);
+        showToast("Interactive Analysis active: tap or click pieces to test variations!", "info", 3500);
         $(this).addClass('hidden-element');
     });
 
@@ -3123,7 +3068,7 @@ function setupAnalysisNavigation() {
         isAnalysisMode = true;
         analysisCurrentIndex = -1;
         analysisGame.reset();
-        board.start();
+        board.start(false);
         clearMoveHighlights();
         updateCheckHighlight();
         updateCapturedPiecesAndMaterial();
@@ -3139,7 +3084,7 @@ function setupAnalysisNavigation() {
             analysisCurrentIndex--;
             if (analysisCurrentIndex === -1) {
                 analysisGame.reset();
-                board.start();
+                board.start(false);
                 clearMoveHighlights();
                 updateCheckHighlight();
                 updateCapturedPiecesAndMaterial();
@@ -3242,7 +3187,7 @@ function startSoloMatch() {
     gameResultSettled = false;
     game.reset();
     analysisGame.reset();
-    board.start();
+    board.start(false);
     clearMoveHighlights();
     updateCapturedPiecesAndMaterial();
     renderLiveMoveNotation();
@@ -3310,22 +3255,34 @@ EventBus.on('gameStart', () => soundManager.play('gameStart'));
 
 $(document).ready(function () {
     $('body').append(`
-        <div id="promotion-selector" class="hidden-element" style="
-            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            background: rgba(19, 22, 31, 0.96); border: 2px solid #3b82f6; border-radius: 12px; padding: 16px;
-            display: none; gap: 12px; z-index: 6000; box-shadow: 0 20px 50px rgba(0,0,0,0.85);
-        ">
-            <img id="promo-queen" style="width:60px; cursor:pointer;" title="Queen" />
-            <img id="promo-rook" style="width:60px; cursor:pointer;" title="Rook" />
-            <img id="promo-bishop" style="width:60px; cursor:pointer;" title="Bishop" />
-            <img id="promo-knight" style="width:60px; cursor:pointer;" title="Knight" />
+        <div id="promotion-selector" class="promotion-backdrop hidden-element">
+            <div class="promotion-card">
+                <div class="promotion-title">Promote Pawn</div>
+                <div class="promotion-options">
+                    <button type="button" class="promo-choice-btn" id="promo-btn-q" title="Queen"><img id="promo-queen" alt="Queen" /></button>
+                    <button type="button" class="promo-choice-btn" id="promo-btn-r" title="Rook"><img id="promo-rook" alt="Rook" /></button>
+                    <button type="button" class="promo-choice-btn" id="promo-btn-b" title="Bishop"><img id="promo-bishop" alt="Bishop" /></button>
+                    <button type="button" class="promo-choice-btn" id="promo-btn-n" title="Knight"><img id="promo-knight" alt="Knight" /></button>
+                </div>
+                <button type="button" id="promo-cancel-btn" class="btn-secondary promo-cancel-btn">Cancel</button>
+            </div>
         </div>
     `);
 
-    $('#promo-queen').click(() => { if (pendingPromotion) pendingPromotion.callback('q'); });
-    $('#promo-rook').click(() => { if (pendingPromotion) pendingPromotion.callback('r'); });
-    $('#promo-bishop').click(() => { if (pendingPromotion) pendingPromotion.callback('b'); });
-    $('#promo-knight').click(() => { if (pendingPromotion) pendingPromotion.callback('n'); });
+    $('#promo-btn-q').click(() => { if (pendingPromotion) pendingPromotion.callback('q'); });
+    $('#promo-btn-r').click(() => { if (pendingPromotion) pendingPromotion.callback('r'); });
+    $('#promo-btn-b').click(() => { if (pendingPromotion) pendingPromotion.callback('b'); });
+    $('#promo-btn-n').click(() => { if (pendingPromotion) pendingPromotion.callback('n'); });
+    $('#promo-cancel-btn').click(() => {
+        hidePromotionSelector();
+        clearSquareSelection();
+    });
+    $('#promotion-selector').click(function (e) {
+        if (e.target === this) {
+            hidePromotionSelector();
+            clearSquareSelection();
+        }
+    });
 
     loadSettings();
     loadFriendsFromStorage();
@@ -3342,7 +3299,22 @@ $(document).ready(function () {
         window.ethereum.on('chainChanged', () => location.reload());
     }
 
-    $('#btn-flip-board').click(() => { if (board) board.flip(); });
+    let boardResizeTimer = null;
+    $(window).on('resize orientationchange', () => {
+        if (!board) return;
+        clearTimeout(boardResizeTimer);
+        boardResizeTimer = setTimeout(() => {
+            board.resize();
+            reapplyBoardHighlights();
+        }, 120);
+    });
+
+    $('#btn-flip-board').click(() => {
+        if (board) {
+            board.flip();
+            reapplyBoardHighlights();
+        }
+    });
     $('#btn-copy-pgn').click(() => {
         navigator.clipboard.writeText(game.pgn() || "No moves played yet.");
         showToast("PGN copied to clipboard!", "success");
@@ -3369,7 +3341,10 @@ $(document).ready(function () {
         $('#home-view-container').addClass('hidden-element');
         $('#arena-app-wrapper').removeClass('hidden-element');
         if (board === null) initChessboard();
-        else board.resize();
+        else {
+            board.resize();
+            reapplyBoardHighlights();
+        }
         updateFloatingControls();
     });
 

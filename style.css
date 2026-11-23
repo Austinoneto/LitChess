@@ -107,6 +107,90 @@ body {
     margin-top: 8px;
 }
 
+/* --- Pawn Promotion Modal (Desktop & Mobile Tap-Friendly) --- */
+.promotion-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(5, 6, 10, 0.78);
+    backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    z-index: 6000;
+}
+
+.promotion-card {
+    background: rgba(19, 22, 31, 0.98);
+    border: 2px solid var(--accent-primary);
+    border-radius: 14px;
+    padding: 18px 20px;
+    box-shadow: 0 22px 55px rgba(0, 0, 0, 0.88);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    max-width: 340px;
+    width: 100%;
+    animation: promo-pop 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes promo-pop {
+    from { transform: scale(0.9); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+}
+
+.promotion-title {
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: #e2e8f0;
+}
+
+.promotion-options {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    width: 100%;
+}
+
+.promo-choice-btn {
+    background: var(--bg-elevated);
+    border: 1.5px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform 0.12s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.promo-choice-btn:hover,
+.promo-choice-btn:active {
+    background: #26314a;
+    border-color: #60a5fa;
+    transform: translateY(-2px) scale(1.04);
+}
+
+.promo-choice-btn img {
+    width: 52px;
+    height: 52px;
+    display: block;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+
+.promo-cancel-btn {
+    width: 100%;
+    padding: 8px 14px;
+    font-size: 12px;
+}
+
 /* --- Homepage Hero View --- */
 .hero {
     width: 100vw;
@@ -373,6 +457,7 @@ button {
     font-weight: 700;
     border-radius: 6px;
     cursor: pointer;
+    touch-action: manipulation;
     transition: background 0.18s, transform 0.1s;
 }
 
@@ -544,6 +629,8 @@ label {
     border-radius: 6px;
     font-size: 12px;
     margin-bottom: 10px;
+    flex-wrap: wrap;
+    gap: 8px;
 }
 
 .wallet-node-wrapper { display: flex; align-items: center; gap: 8px; }
@@ -656,6 +743,28 @@ label {
     padding: 6px;
     border-radius: 6px;
     border: 1px solid var(--border-subtle);
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+}
+
+#myBoard,
+#myBoard .square-55d63 {
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    cursor: pointer;
+}
+
+#myBoard img {
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+    transition: transform 0.14s cubic-bezier(0.22, 1, 0.36, 1), filter 0.14s ease;
 }
 
 .board-utility-strip {
@@ -665,6 +774,7 @@ label {
     width: 100%;
     max-width: 470px;
     justify-content: center;
+    flex-wrap: wrap;
 }
 
 .btn-util {
@@ -721,56 +831,107 @@ label {
     margin-left: -12px;
 }
 
-/* Board Square Themes & Move / Premove Highlights */
-[class*="white-"] { background-color: #e2e8f0 !important; color: #345d9d !important; }
-[class*="black-"] { background-color: #8fa9d4 !important; color: #e2e8f0 !important; }
+/* Board Square Themes */
+#myBoard [class*="white-"] { background-color: #e2e8f0 !important; color: #345d9d !important; }
+#myBoard [class*="black-"] { background-color: #8fa9d4 !important; color: #e2e8f0 !important; }
 
-body.theme-wood #myBoard .white-1e1d7 { background-color: #d8b485 !important; }
-body.theme-wood #myBoard .black-b7c6d { background-color: #7c4f2b !important; }
+body.theme-wood #myBoard [class*="white-"] { background-color: #d8b485 !important; color: #7c4f2b !important; }
+body.theme-wood #myBoard [class*="black-"] { background-color: #7c4f2b !important; color: #d8b485 !important; }
 
-body.theme-green #myBoard .white-1e1d7 { background-color: #eaefd2 !important; }
-body.theme-green #myBoard .black-b7c6d { background-color: #769656 !important; }
+body.theme-green #myBoard [class*="white-"] { background-color: #eaefd2 !important; color: #769656 !important; }
+body.theme-green #myBoard [class*="black-"] { background-color: #769656 !important; color: #eaefd2 !important; }
 
-.square-highlight-from { background-color: rgba(250, 204, 21, 0.65) !important; }
-.square-highlight-to { background-color: rgba(245, 158, 11, 0.8) !important; }
-.square-premove { background-color: rgba(239, 68, 68, 0.62) !important; box-shadow: inset 0 0 8px #991b1b; }
-
-@keyframes checkmate-flash {
-    0%   { background-color: #ef4444 !important; }
-    50%  { background-color: #7f1d1d !important; }
-    100% { background-color: #ef4444 !important; }
-}
-.checkmate-king { animation: checkmate-flash 1.2s infinite !important; }
-
-/* Click-to-Move, Legal Target Dots & In-Check Glow */
-.square-selected {
-    background-color: rgba(59, 130, 246, 0.55) !important;
-    box-shadow: inset 0 0 10px rgba(30, 64, 175, 0.9);
+/* Board Move, Premove, Selection & Check Highlights (Outranks All Board Themes) */
+html body #myBoard .square-55d63.square-highlight-from {
+    background-color: rgba(250, 204, 21, 0.68) !important;
 }
 
-.square-legal-move {
+html body #myBoard .square-55d63.square-highlight-to {
+    background-color: rgba(245, 158, 11, 0.82) !important;
+}
+
+html body #myBoard .square-55d63.square-premove {
+    background-color: rgba(239, 68, 68, 0.62) !important;
+    box-shadow: inset 0 0 8px #991b1b;
+}
+
+html body #myBoard .square-55d63.square-selected {
     position: relative;
+    z-index: 20;
+    background-color: rgba(59, 130, 246, 0.65) !important;
+    box-shadow: inset 0 0 0 3px rgba(147, 197, 253, 0.95), inset 0 0 12px rgba(30, 64, 175, 0.85);
 }
 
-.square-legal-move::after {
+html body #myBoard .square-55d63.square-selected-premove {
+    position: relative;
+    z-index: 20;
+    background-color: rgba(245, 158, 11, 0.62) !important;
+    box-shadow: inset 0 0 0 3px rgba(251, 191, 36, 0.95), inset 0 0 12px rgba(180, 83, 9, 0.85);
+}
+
+html body #myBoard .square-55d63.square-selected img {
+    transform: translateY(-5px) scale(1.13);
+    filter: drop-shadow(0 8px 8px rgba(0, 0, 0, 0.65));
+    position: relative;
+    z-index: 21;
+}
+
+html body #myBoard .square-55d63.square-legal-move {
+    position: relative;
+    cursor: pointer;
+}
+
+html body #myBoard .square-55d63.square-legal-move::after {
     content: "";
     position: absolute;
-    width: 28%;
-    height: 28%;
-    top: 36%;
-    left: 36%;
+    width: 30%;
+    height: 30%;
+    top: 35%;
+    left: 35%;
     border-radius: 50%;
-    background: rgba(16, 185, 129, 0.65);
+    background: rgba(16, 185, 129, 0.78);
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.55);
     pointer-events: none;
-    z-index: 5;
+    z-index: 6;
+    transition: transform 0.12s ease, background 0.12s ease;
 }
 
-.square-legal-capture {
-    box-shadow: inset 0 0 0 4px rgba(239, 68, 68, 0.75) !important;
+html body #myBoard .square-55d63.square-legal-move:hover::after {
+    transform: scale(1.22);
+    background: rgba(52, 211, 153, 0.95);
 }
 
-.king-in-check {
-    background: radial-gradient(circle, rgba(239, 68, 68, 0.92) 0%, rgba(185, 28, 28, 0.65) 60%, transparent 100%) !important;
+html body #myBoard .square-55d63.square-legal-capture {
+    position: relative;
+    cursor: pointer;
+    background-image: radial-gradient(circle, transparent 56%, rgba(239, 68, 68, 0.45) 100%) !important;
+}
+
+html body #myBoard .square-55d63.square-legal-capture::after {
+    content: "";
+    position: absolute;
+    inset: 6%;
+    border-radius: 50%;
+    border: 4px solid rgba(239, 68, 68, 0.88);
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.45);
+    pointer-events: none;
+    z-index: 6;
+}
+
+html body #myBoard .square-55d63.king-in-check {
+    background-image: radial-gradient(circle, rgba(239, 68, 68, 0.92) 0%, rgba(185, 28, 28, 0.65) 60%, transparent 100%) !important;
+}
+
+@keyframes checkmate-pulse {
+    0%   { box-shadow: inset 0 0 6px #fca5a5, inset 0 0 18px #7f1d1d; }
+    50%  { box-shadow: inset 0 0 18px #7f1d1d, inset 0 0 36px #450a0a; }
+    100% { box-shadow: inset 0 0 6px #fca5a5, inset 0 0 18px #7f1d1d; }
+}
+
+html body #myBoard .square-55d63.checkmate-king {
+    background-color: #ef4444 !important;
+    background-image: none !important;
+    animation: checkmate-pulse 1.2s infinite;
 }
 
 .opening-explorer-bar {
@@ -1015,4 +1176,63 @@ input:checked + .slider:before { transform: translateX(24px); }
     .board-panel { order: 1; }
     .interaction-panel { order: 2; }
     .game-mode-selectors { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 600px) {
+    body {
+        padding: 10px 8px 24px 8px;
+    }
+    .panel {
+        padding: 12px;
+    }
+    .hero-content {
+        padding: 1.5rem 1.2rem;
+    }
+    .hero h1 {
+        font-size: 2.2rem;
+    }
+    .landing-top-bar {
+        top: 12px;
+        left: 12px;
+        right: 12px;
+    }
+    .match-arena-container {
+        max-width: 100%;
+        gap: 6px;
+        align-items: stretch;
+    }
+    .hidden-eval {
+        margin-left: -6px;
+    }
+    .eval-gauge-track {
+        height: auto;
+        min-height: 240px;
+        width: 18px;
+    }
+    .chessboard-frame {
+        padding: 4px;
+    }
+    .player-tag-bar {
+        padding: 6px 8px;
+        font-size: 12px;
+    }
+    .chess-clock {
+        font-size: 14px;
+        min-width: 62px;
+        padding: 3px 7px;
+    }
+    .promo-choice-btn img {
+        width: 44px;
+        height: 44px;
+    }
+    #toast-container {
+        right: 10px;
+        left: 10px;
+        bottom: 12px;
+        max-width: none;
+    }
+    #floating-controls {
+        top: 10px;
+        right: 10px;
+    }
 }
