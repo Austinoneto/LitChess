@@ -5,7 +5,6 @@
  * ============================================================================
  */
 
-const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const ethers = require('ethers');
@@ -16,8 +15,22 @@ const DEFAULT_PRIVACY = {
     dms: 'everyone'         // 'everyone' | 'friends' | 'nobody'
 };
 
+function createEmptyDb() {
+    return {
+        users: {},          // wallet -> { wallet, username, privacy, notes, clubId, totalZkLtcWon, currentStreak, bestStreak, lastSeen, createdAt }
+        friendships: [],    // { id, requester, recipient, status: 'pending'|'accepted'|'blocked', createdAt, updatedAt }
+        follows: [],        // { follower, target, createdAt }
+        directMessages: [], // { id, threadId, sender, senderName, recipient, recipientName, body, readAt, createdAt }
+        matches: [],        // { matchId, white, black, whiteName, blackName, winner, winnerColor, reason, timeControl, isPaid, wagerEth, pgn, moveCount, timestamp }
+        clubs: {},          // clubId -> { id, name, tag, description, owner, members: [], messages: [], createdAt }
+        activityFeed: [],   // { id, actor, actorName, actorClubTag, kind, text, matchId, clubId, createdAt }
+        reports: []         // { id, reporter, target, reason, createdAt }
+    };
+}
+
 function createSocialServer(deps) {
     const {
+        storage,
         rooms,
         playerRatings,
         usernameToAddress,
@@ -30,68 +43,40 @@ function createSocialServer(deps) {
     } = deps;
 
     // =========================================================================
-    // 1. ATOMIC PERSISTENT DATABASE (social_db.json)
+    // 1. PERSISTENT DATABASE (PostgreSQL via storage.js, or local social_db.json)
     // =========================================================================
-    let db = {
-        users: {},          // wallet -> { wallet, username, privacy, notes, clubId, totalZkLtcWon, currentStreak, bestStreak, lastSeen, createdAt }
-        friendships: [],    // { id, requester, recipient, status: 'pending'|'accepted'|'blocked', createdAt, updatedAt }
-        follows: [],        // { follower, target, createdAt }
-        directMessages: [], // { id, threadId, sender, senderName, recipient, recipientName, body, readAt, createdAt }
-        matches: [],        // { matchId, white, black, whiteName, blackName, winner, winnerColor, reason, timeControl, isPaid, wagerEth, pgn, moveCount, timestamp }
-        clubs: {},          // clubId -> { id, name, tag, description, owner, members: [], messages: [], createdAt }
-        activityFeed: [],   // { id, actor, actorName, actorClubTag, kind, text, matchId, clubId, createdAt }
-        reports: []         // { id, reporter, target, reason, createdAt }
-    };
-
-    let dbSaveChain = Promise.resolve();
+    let db = createEmptyDb();
     const onlineSockets = new Map();    // wallet -> Set<ws>
     const directChallenges = new Map(); // challengeId -> challengeObj
 
-    function loadDbSync() {
+    async function init() {
         try {
-            if (fs.existsSync(SOCIAL_DB_FILE)) {
-                const raw = fs.readFileSync(SOCIAL_DB_FILE, 'utf8');
-                if (raw && raw.trim()) {
-                    const parsed = JSON.parse(raw);
-                    db = {
-                        users: parsed.users || {},
-                        friendships: Array.isArray(parsed.friendships) ? parsed.friendships : [],
-                        follows: Array.isArray(parsed.follows) ? parsed.follows : [],
-                        directMessages: Array.isArray(parsed.directMessages) ? parsed.directMessages : [],
-                        matches: Array.isArray(parsed.matches) ? parsed.matches : [],
-                        clubs: parsed.clubs || {},
-                        activityFeed: Array.isArray(parsed.activityFeed) ? parsed.activityFeed : [],
-                        reports: Array.isArray(parsed.reports) ? parsed.reports : []
-                    };
-                    for (const [w, u] of Object.entries(db.users)) {
-                        if (u && u.username && !String(u.username).includes('...')) {
-                            usernameToAddress.set(String(u.username).toLowerCase(), w.toLowerCase());
-                        }
-                    }
-                    console.log(`[SOCIAL] Loaded social_db.json (${Object.keys(db.users).length} users, ${db.friendships.length} links, ${Object.keys(db.clubs).length} clubs)`);
+            const parsed = await storage.loadJSON('social_db', SOCIAL_DB_FILE, createEmptyDb());
+            db = {
+                users: (parsed && parsed.users) || {},
+                friendships: Array.isArray(parsed?.friendships) ? parsed.friendships : [],
+                follows: Array.isArray(parsed?.follows) ? parsed.follows : [],
+                directMessages: Array.isArray(parsed?.directMessages) ? parsed.directMessages : [],
+                matches: Array.isArray(parsed?.matches) ? parsed.matches : [],
+                clubs: (parsed && parsed.clubs) || {},
+                activityFeed: Array.isArray(parsed?.activityFeed) ? parsed.activityFeed : [],
+                reports: Array.isArray(parsed?.reports) ? parsed.reports : []
+            };
+            for (const [w, u] of Object.entries(db.users)) {
+                if (u && u.username && !String(u.username).includes('...')) {
+                    usernameToAddress.set(String(u.username).toLowerCase(), w.toLowerCase());
                 }
-            } else {
-                console.log('[SOCIAL] No existing social_db.json found — initializing fresh social graph.');
             }
+            console.log(`[SOCIAL] Loaded social graph (${Object.keys(db.users).length} users, ${db.friendships.length} links, ${Object.keys(db.clubs).length} clubs, ${db.matches.length} matches)`);
         } catch (err) {
-            console.error('[SOCIAL] Failed to load social_db.json — starting clean:', err.message);
+            console.error('[SOCIAL] Failed to initialize social DB — starting clean:', err.message);
+            db = createEmptyDb();
         }
     }
 
     function saveDb() {
-        dbSaveChain = dbSaveChain.then(async () => {
-            try {
-                const tmp = SOCIAL_DB_FILE + '.tmp';
-                await fs.promises.writeFile(tmp, JSON.stringify(db, null, 2), 'utf8');
-                await fs.promises.rename(tmp, SOCIAL_DB_FILE);
-            } catch (err) {
-                console.error('[SOCIAL] Save failed:', err.message);
-            }
-        });
-        return dbSaveChain;
+        return storage.saveJSON('social_db', SOCIAL_DB_FILE, db);
     }
-
-    loadDbSync();
 
     // =========================================================================
     // 2. IDENTITY, PRESENCE & RELATIONSHIP HELPERS
@@ -1794,6 +1779,7 @@ function createSocialServer(deps) {
     }
 
     return {
+        init,
         onConnect,
         onDisconnect,
         handleMessage,

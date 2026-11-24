@@ -13,6 +13,7 @@
         nonce: null,
         authedWallet: null,
         isAuthing: false,
+        authRetryTimer: null,
         me: null,
         friends: [],
         following: [],
@@ -41,20 +42,29 @@
     const AWAY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes idle -> Away
 
     // =========================================================================
-    // 1. HELPERS
+    // 1. HELPERS (Copy-paste-safe HTML escaping & Time Control formatting)
     // =========================================================================
     function esc(str) {
-    return String(str == null ? '' : str)
-        .replace(/&/g, '\x26amp;')
-        .replace(/</g, '\x26lt;')
-        .replace(/>/g, '\x26gt;')
-        .replace(/"/g, '\x26quot;')
-        .replace(/'/g, '\x26#39;');
-}
+        return String(str == null ? '' : str)
+            .replace(/&/g, '\x26amp;')
+            .replace(/</g, '\x26lt;')
+            .replace(/>/g, '\x26gt;')
+            .replace(/"/g, '\x26quot;')
+            .replace(/'/g, '\x26#39;');
+    }
 
     function shortWallet(w) {
         if (!w || w.length < 12) return w || '';
         return w.slice(0, 6) + '...' + w.slice(-4);
+    }
+
+    function formatTimeControlLabel(tc) {
+        const key = String(tc || 'blitz').toLowerCase();
+        if (key === 'bullet') return '1+0 BULLET';
+        if (key === 'blitz3_2') return '3+2 BLITZ';
+        if (key === 'blitz5') return '5+0 BLITZ';
+        if (key === 'rapid') return '10+0 RAPID';
+        return '3+0 BLITZ';
     }
 
     function timeAgo(ts) {
@@ -76,7 +86,7 @@
 
     function presenceLabel(presence) {
         const s = presence && presence.status ? presence.status : 'offline';
-        if (s === 'in_match') return `Playing ${(presence.timeControl || 'chess').toUpperCase()}${presence.isPaid ? ' (zkLTC)' : ''}`;
+        if (s === 'in_match') return `Playing ${formatTimeControlLabel(presence.timeControl)}${presence.isPaid ? ' (zkLTC)' : ''}`;
         if (s === 'online') return 'Online (Lobby)';
         if (s === 'away') return 'Away';
         return presence && presence.lastSeen ? `Last seen ${timeAgo(presence.lastSeen)}` : 'Offline';
@@ -124,21 +134,43 @@
     }
 
     // =========================================================================
-    // 2. ZERO-POPUP SOCIAL AUTHENTICATION & 4-STATE PRESENCE ENGINE
+    // 2. ZERO-POPUP SOCIAL AUTHENTICATION (RACE-FREE ON F5 REFRESH) & PRESENCE
     // =========================================================================
+    function scheduleAuthRetry(delayMs = 700) {
+        if (state.authRetryTimer) clearTimeout(state.authRetryTimer);
+        state.authRetryTimer = setTimeout(() => {
+            state.authRetryTimer = null;
+            attemptSocialAuth();
+        }, delayMs);
+    }
+
     async function attemptSocialAuth() {
-        if (state.isAuthing || !state.nonce) return;
+        if (state.isAuthing) return;
         const ctx = getBridge().getContext ? getBridge().getContext() : {};
         const wallet = ctx.wallet ? ctx.wallet.toLowerCase() : null;
         if (!wallet) return;
-        if (state.authedWallet === wallet && getSocket()) return;
 
         const sock = getSocket();
-        if (!sock) return;
+        if (!sock) {
+            if (typeof window.connectLobbyTelemetrySocket === 'function') {
+                window.connectLobbyTelemetrySocket();
+            }
+            scheduleAuthRetry(800);
+            return;
+        }
+
+        if (state.authedWallet === wallet) return;
+
+        // If socket is open but we missed SOCIAL_HELLO (or nonce was spent), wait briefly then reconnect
+        if (!state.nonce) {
+            scheduleAuthRetry(600);
+            return;
+        }
 
         state.isAuthing = true;
+        const nonceToSign = state.nonce;
         try {
-            const expectedMsg = `LITCHESS_SOCIAL_${wallet}_${state.nonce}`;
+            const expectedMsg = `LITCHESS_SOCIAL_${wallet}_${nonceToSign}`;
             let delegateBundle = typeof window.getCachedDelegatedSession === 'function'
                 ? window.getCachedDelegatedSession(wallet)
                 : null;
@@ -147,9 +179,15 @@
                 delegateBundle = await window.getOrCreateDelegatedSession(wallet, ctx.signer);
             }
 
+            const activeSock = getSocket();
+            if (!activeSock) {
+                scheduleAuthRetry(800);
+                return;
+            }
+
             if (delegateBundle && delegateBundle.delegateWallet) {
                 const signature = await delegateBundle.delegateWallet.signMessage(expectedMsg);
-                sock.send(JSON.stringify({
+                activeSock.send(JSON.stringify({
                     type: 'AUTH_SOCIAL',
                     wallet,
                     signature,
@@ -158,7 +196,7 @@
                 }));
             } else if (ctx.signer) {
                 const signature = await ctx.signer.signMessage(expectedMsg);
-                sock.send(JSON.stringify({
+                activeSock.send(JSON.stringify({
                     type: 'AUTH_SOCIAL',
                     wallet,
                     signature
@@ -279,7 +317,7 @@
         $('#friends-online-count').text(`${onlineCount} / ${state.friends.length} online`);
 
         if (!state.authedWallet) {
-            fList.html('<div class="social-empty-state">Connect wallet to sync friends &amp; live presence.</div>');
+            fList.html('<div class="social-empty-state">Connect wallet to sync friends & live presence.</div>');
         } else if (state.friends.length === 0) {
             fList.html('<div class="social-empty-state">No friends yet. Use the search bar above to find players!</div>');
         } else {
@@ -311,7 +349,7 @@
         const folList = $('#following-list').empty();
         $('#following-count').text(state.following.length);
         if (state.following.length === 0) {
-            folList.html('<div class="social-empty-state">Follow top players to track &amp; spectate them.</div>');
+            folList.html('<div class="social-empty-state">Follow top players to track & spectate them.</div>');
         } else {
             state.following.forEach(u => {
                 const isPlaying = u.presence && u.presence.status === 'in_match' && u.presence.activeMatchId;
@@ -708,7 +746,6 @@
             formWrap.html('<small style="color:#64748b;">No rated games yet</small>');
         }
 
-        // H2H Box
         if (p.h2h && p.h2h.total > 0) {
             $('#prof-h2h-box').removeClass('hidden-element');
             $('#prof-h2h-title').text(p.h2h.isRival ? '⚔️ Rivalry Series vs You' : 'Head-to-Head vs You');
@@ -717,7 +754,6 @@
             $('#prof-h2h-box').addClass('hidden-element');
         }
 
-        // Action Buttons
         const actionBar = $('#prof-action-bar').empty();
         const isSelf = p.relationship === 'self';
         if (!isSelf) {
@@ -754,7 +790,6 @@
             $('#prof-note-section, #prof-safety-bar').addClass('hidden-element');
         }
 
-        // Recent Games List
         const gamesBox = $('#prof-recent-games').empty();
         if (!p.recentGames || p.recentGames.length === 0) {
             gamesBox.html('<div class="social-empty-state">No recorded matches yet.</div>');
@@ -767,7 +802,7 @@
                             <span class="form-pill ${g.result}" style="margin-right:5px;">${g.result}</span>
                             <strong>${esc(g.whiteName)}</strong> vs <strong>${esc(g.blackName)}</strong>
                             <div style="font-size:10px; color:#64748b; margin-top:2px;">
-                                ${esc(g.timeControl.toUpperCase())}${stakeTag} • ${esc(g.reason.replace(/_/g, ' '))} • ${timeAgo(g.timestamp)}
+                                ${esc(formatTimeControlLabel(g.timeControl))}${stakeTag} • ${esc(g.reason.replace(/_/g, ' '))} • ${timeAgo(g.timestamp)}
                             </div>
                         </div>
                         ${g.pgn ? `<button class="btn-icon-xs" data-analyze-game-idx="${idx}" title="Open in Analysis Board">🔍 Analyze</button>` : ''}
@@ -815,7 +850,6 @@
             return;
         }
 
-        // Wagered zkLTC Direct Challenge (Automated createChallenge -> WS ephemeral key relay)
         const rawStake = $('#dc-stake-input').val();
         const stake = typeof window.normalizeStake === 'function' ? window.normalizeStake(rawStake) : rawStake;
         if (!stake || !ctx.contract || !ctx.signer || !ctx.wallet) {
@@ -870,7 +904,7 @@
             <div class="challenge-banner-row">
                 <div>
                     <div class="challenge-banner-title">⚔️ Challenge from ${esc(ch.fromName)} ${clubTagHtml(ch.fromClubTag)}</div>
-                    <div class="challenge-banner-sub">${esc(ch.timeControl.toUpperCase())}${wagerStr} • Blitz ${ch.fromRatings?.blitz || 2000}</div>
+                    <div class="challenge-banner-sub">${esc(formatTimeControlLabel(ch.timeControl))}${wagerStr} • Blitz ${ch.fromRatings?.blitz || 2000}</div>
                 </div>
                 <span id="inc-ch-timer" class="challenge-countdown-pill">60s</span>
             </div>
@@ -894,7 +928,7 @@
             <div class="challenge-banner-row">
                 <div>
                     <div class="challenge-banner-title">⏳ Challenge Sent to ${esc(ch.toName)}</div>
-                    <div class="challenge-banner-sub">${esc(ch.timeControl.toUpperCase())}${wagerStr} — Waiting for response...</div>
+                    <div class="challenge-banner-sub">${esc(formatTimeControlLabel(ch.timeControl))}${wagerStr} — Waiting for response...</div>
                 </div>
                 <span id="out-ch-timer" class="challenge-countdown-pill">60s</span>
             </div>
@@ -1024,11 +1058,20 @@
         switch (data.type) {
             case 'SOCIAL_HELLO':
                 state.nonce = data.nonce;
+                state.isAuthing = false;
                 attemptSocialAuth();
                 return true;
 
             case 'SOCIAL_AUTH_OK':
                 state.authedWallet = data.wallet;
+                state.nonce = null; // Nonce consumed & rotated server-side
+                if (state.authRetryTimer) {
+                    clearTimeout(state.authRetryTimer);
+                    state.authRetryTimer = null;
+                }
+                if (typeof window.updateProfileRatingsDisplay === 'function') {
+                    window.updateProfileRatingsDisplay();
+                }
                 return true;
 
             case 'SOCIAL_ERROR':
@@ -1062,6 +1105,10 @@
                 renderClubsView();
                 renderActivityFeed();
                 updateNotificationBadges();
+
+                if (typeof window.updateProfileRatingsDisplay === 'function') {
+                    window.updateProfileRatingsDisplay();
+                }
 
                 if (Array.isArray(data.incomingChallenges) && data.incomingChallenges.length > 0 && !state.activeIncomingChallenge) {
                     renderIncomingChallengeBanner(data.incomingChallenges[0]);
@@ -1228,12 +1275,10 @@
     // 9. DOM EVENT BINDINGS
     // =========================================================================
     function bindDomEvents() {
-        // Social panel tabs
         $(document).on('click', '.social-tab-btn', function () {
             switchSocialTab($(this).data('tab'));
         });
 
-        // Feed vs Leaderboard subtabs
         $('#feed-subtab-activity').click(function () {
             $('#feed-subtab-activity').addClass('active');
             $('#feed-subtab-leaderboard').removeClass('active');
@@ -1254,7 +1299,6 @@
             sendSocial({ type: 'GET_LEADERBOARD', format: $(this).val() });
         });
 
-        // Debounced live search (Homepage + Arena)
         $('#search-user-input-home').on('input', function () {
             clearTimeout(state.searchTimers.home);
             const val = $(this).val();
@@ -1273,14 +1317,12 @@
         });
         $('#btn-search-user').off('click').on('click', () => triggerFuzzySearch($('#search-user-input').val(), 'arena'));
 
-        // Close autocomplete dropdowns on outside click
         $(document).on('click', function (e) {
             if (!$(e.target).closest('.global-search-wrap').length) $('#search-dropdown-home').addClass('hidden-element');
             if (!$(e.target).closest('.arena-search-wrap').length) $('#search-dropdown-arena').addClass('hidden-element');
             if (!$(e.target).closest('#btn-social-bell-home, #home-social-popover').length) $('#home-social-popover').addClass('hidden-element');
         });
 
-        // Homepage Notification Bell
         $('#btn-social-bell-home').click(function () {
             $('#home-social-popover').toggleClass('hidden-element');
             renderHomePopover();
@@ -1296,7 +1338,6 @@
             openDmConversation(w, thread ? thread.username : shortWallet(w));
         });
 
-        // Open Profile Dossier from anywhere
         $(document).on('click', '[data-open-profile]', function () {
             openPlayerProfile($(this).data('open-profile'), false);
         });
@@ -1304,7 +1345,12 @@
         $('#opponent-name').click(function () {
             const ctx = getBridge().getContext ? getBridge().getContext() : {};
             if (ctx.opponentWallet) openPlayerProfile(ctx.opponentWallet, false);
-            else if (ctx.opponentUsername && !ctx.opponentUsername.startsWith('LitEngine') && ctx.opponentUsername !== 'Opponent') {
+            else if (
+                ctx.opponentUsername &&
+                !ctx.opponentUsername.startsWith('LitEngine') &&
+                !ctx.opponentUsername.startsWith('Guest_') &&
+                ctx.opponentUsername !== 'Opponent'
+            ) {
                 openPlayerProfile(ctx.opponentUsername, true);
             }
         });
@@ -1321,7 +1367,6 @@
             }
         });
 
-        // Profile Modal controls
         $('#btn-close-profile-modal').click(() => $('#player-profile-modal').addClass('hidden-element'));
         $('#player-profile-modal').click(function (e) { if (e.target === this) $(this).addClass('hidden-element'); });
 
@@ -1363,7 +1408,6 @@
             }
         });
 
-        // Load historical game PGN into Analysis Board
         $(document).on('click', '[data-analyze-game-idx]', function () {
             const idx = parseInt($(this).data('analyze-game-idx'), 10);
             const g = state.activeProfile && state.activeProfile.recentGames ? state.activeProfile.recentGames[idx] : null;
@@ -1373,7 +1417,6 @@
             }
         });
 
-        // Friendships, Follows, Unblock, Spectate
         $(document).on('click', '[data-send-freq]', function () {
             sendSocial({ type: 'FRIEND_REQUEST_SEND', targetWallet: $(this).data('send-freq') });
         });
@@ -1401,7 +1444,6 @@
             if (typeof window.spectateMatchById === 'function') window.spectateMatchById(mId);
         });
 
-        // Direct Messages
         $(document).on('click', '[data-open-dm]', function () {
             $('#player-profile-modal').addClass('hidden-element');
             if ($('#home-view-container').is(':visible')) {
@@ -1433,7 +1475,6 @@
         $('#btn-dm-send').click(sendCurrentDm);
         $('#dm-chat-input').keypress(e => { if (e.which === 13) sendCurrentDm(); });
 
-        // Direct Challenge Modal & Banners
         $(document).on('click', '[data-challenge-wallet]', function () {
             openDirectChallengeModal($(this).data('challenge-wallet'), $(this).data('challenge-name'));
         });
@@ -1480,7 +1521,6 @@
             $('#outgoing-challenge-banner').addClass('hidden-element').empty();
         });
 
-        // Clubs / Guilds
         $('#btn-open-create-club').click(() => {
             if (!state.authedWallet) {
                 notifyToast('Connect your wallet to found a club.', 'warn');
@@ -1516,7 +1556,6 @@
             if (e.which === 13) $('#btn-club-chat-send').click();
         });
 
-        // Privacy Settings inside #settings-panel
         $('#privacy-challenges-select, #privacy-dms-select').change(() => {
             if (!state.authedWallet) {
                 notifyToast('Connect your wallet to save privacy preferences.', 'warn');
@@ -1536,10 +1575,16 @@
     window.LitSocial = {
         onSocketOpen(ws) {
             state.socket = ws;
+            state.nonce = null;
             state.authedWallet = null;
+            state.isAuthing = false;
         },
         onWalletChanged(wallet) {
             if (!wallet) {
+                if (state.authRetryTimer) {
+                    clearTimeout(state.authRetryTimer);
+                    state.authRetryTimer = null;
+                }
                 state.authedWallet = null;
                 state.me = null;
                 state.friends = [];
@@ -1560,10 +1605,15 @@
             attemptSocialAuth();
         },
         onUsernameRegistered() {
-            if (state.authedWallet) {
-                // Force fresh sync so server indexes the newly claimed on-chain handle
-                state.authedWallet = null;
-                attemptSocialAuth();
+            // Reopen the lobby socket cleanly so the server sends a fresh SOCIAL_HELLO nonce
+            // and re-reads the newly claimed on-chain handle from UsernameRegistry.
+            const sock = getSocket();
+            state.authedWallet = null;
+            state.nonce = null;
+            if (sock) {
+                try { sock.close(); } catch (_) {}
+            } else if (typeof window.connectLobbyTelemetrySocket === 'function') {
+                window.connectLobbyTelemetrySocket();
             }
         },
         handleMessage,
@@ -1578,5 +1628,9 @@
     $(document).ready(() => {
         bindDomEvents();
         setupPresenceTrackers();
+
+        // Refresh safety net: if wallet auto-reconnected right before/after SOCIAL_HELLO
+        setTimeout(() => { if (!state.authedWallet) attemptSocialAuth(); }, 900);
+        setTimeout(() => { if (!state.authedWallet) attemptSocialAuth(); }, 2500);
     });
 })();

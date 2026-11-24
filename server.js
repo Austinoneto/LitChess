@@ -5,6 +5,7 @@
  */
 
 const http = require('http');
+const https = require('https');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 const ethers = require('ethers');
@@ -12,6 +13,40 @@ const { Chess } = require('chess.js');
 const fs = require('fs');
 const path = require('path');
 const { createSocialServer } = require('./social-server');
+
+// Built-in atomic JSON fallback adapter (guarantees storage is NEVER null)
+const localJsonStorageFallback = {
+    async initStorage() {},
+    async loadJSON(_key, filePath, fallback = null) {
+        try {
+            if (filePath && fs.existsSync(filePath)) {
+                const raw = await fs.promises.readFile(filePath, 'utf8');
+                if (raw && raw.trim()) return JSON.parse(raw);
+            }
+        } catch (err) {
+            console.warn(`[STORAGE] Local read warning (${path.basename(filePath)}):`, err.message);
+        }
+        return fallback;
+    },
+    async saveJSON(_key, filePath, data) {
+        const tmp = filePath + '.tmp';
+        await fs.promises.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
+        await fs.promises.rename(tmp, filePath);
+    }
+};
+
+let externalStorage = localJsonStorageFallback;
+try {
+    const loaded = require('./storage');
+    if (loaded && typeof loaded.saveJSON === 'function' && typeof loaded.loadJSON === 'function') {
+        externalStorage = loaded;
+        console.log('[STORAGE] Loaded external storage.js adapter.');
+    } else {
+        console.warn('[STORAGE] storage.js missing loadJSON/saveJSON — using local JSON fallback.');
+    }
+} catch (err) {
+    console.warn('[STORAGE] Could not load ./storage.js (' + err.message + ') — using local JSON fallback.');
+}
 
 // =====================================================================
 // 0. BUILT-IN .ENV AUTO-LOADER (Handles .env and Windows .env.txt)
@@ -45,7 +80,7 @@ const { createSocialServer } = require('./social-server');
 // =====================================================================
 // 1. BLOCKCHAIN & ORACLE CONFIGURATION
 // =====================================================================
-const RPC_URL = process.env.RPC_URL || "[https://rpc.testnet.liteforge.zeeve.net](https://rpc.testnet.liteforge.zeeve.net)";
+const RPC_URL = (process.env.RPC_URL || "https://rpc.testnet.liteforge.zeeve.net").trim();
 const CONTRACT_ADDRESS = ethers.getAddress((process.env.CONTRACT_ADDRESS || "0xB04bAF7F9784491A7041b25Bc7d3191c46Cdf73e").trim());
 const USERNAME_REGISTRY_ADDRESS = ethers.getAddress((process.env.USERNAME_REGISTRY_ADDRESS || "0x7ff44d488B5e75adF4ba35B9fbAca68ce9BE92AE").trim());
 
@@ -82,6 +117,7 @@ const USERNAME_REGISTRY_ABI = [
 const usernameRegistry = new ethers.Contract(USERNAME_REGISTRY_ADDRESS, USERNAME_REGISTRY_ABI, provider);
 
 const RESTRICTED_WORDS = ["fool", "idiot", "you're are crazy", "nonsense", "shit", "kill", "nigga", "cunt"];
+const GENERIC_NAMES = new Set(['', 'player', 'guest', 'opponent', 'white', 'black', 'you', 'anon', 'anonymous']);
 
 function ensureBytes32(id) {
     if (!id) return ethers.ZeroHash;
@@ -170,7 +206,7 @@ console.log("🌐 RPC Endpoint     :", RPC_URL);
 console.log("=====================================================");
 
 // =====================================================================
-// 2. FAULT-TOLERANT PERSISTENT RATINGS & STATS ENGINE
+// 2. FAULT-TOLERANT PERSISTENT RATINGS & STATS ENGINE (PG / JSON)
 // =====================================================================
 const RATINGS_FILE = path.join(__dirname, 'ratings.json');
 let playerRatings = {};
@@ -178,30 +214,68 @@ let totalGamesPlayedCount = 24837;
 let saveChain = Promise.resolve();
 const usernameToAddress = new Map();
 
+// Unified storage wrapper that seamlessly works with any storage.js export shape
+// OR falls back to local atomic JSON files.
+async function initExternalStorage() {
+    if (!externalStorage) return;
+    const initFn = externalStorage.initStorage || externalStorage.init || externalStorage.initDb || externalStorage.connect;
+    if (typeof initFn === 'function') {
+        try {
+            await initFn();
+        } catch (err) {
+            console.warn('[STORAGE] External storage init warning:', err.message);
+        }
+    }
+}
+
+async function storageLoadRatingsDoc() {
+    try {
+        const doc = await externalStorage.loadJSON('ratings', RATINGS_FILE, null);
+        if (doc && typeof doc === 'object') return doc;
+    } catch (err) {
+        console.warn('[RATINGS] Storage read failed, falling back to local file:', err.message);
+    }
+    if (fs.existsSync(RATINGS_FILE)) {
+        const raw = await fs.promises.readFile(RATINGS_FILE, 'utf8');
+        if (raw && raw.trim()) return JSON.parse(raw);
+    }
+    return null;
+}
+
+async function storageSaveRatingsDoc(payload) {
+    try {
+        await externalStorage.saveJSON('ratings', RATINGS_FILE, payload);
+        return;
+    } catch (err) {
+        console.warn('[RATINGS] Storage save failed, falling back to local file:', err.message);
+    }
+    const tmp = RATINGS_FILE + '.tmp';
+    await fs.promises.writeFile(tmp, JSON.stringify(payload, null, 2), 'utf8');
+    await fs.promises.rename(tmp, RATINGS_FILE);
+}
+
 async function loadRatings() {
     try {
-        if (fs.existsSync(RATINGS_FILE)) {
-            const raw = await fs.promises.readFile(RATINGS_FILE, 'utf8');
-            if (!raw.trim()) {
-                playerRatings = {};
-                await saveRatings();
-                return;
-            }
-            const parsed = JSON.parse(raw);
-            if (parsed._meta && typeof parsed._meta.totalGames === 'number') {
-                totalGamesPlayedCount = parsed._meta.totalGames;
-                delete parsed._meta;
-            }
-            playerRatings = parsed;
-            for (const [addr, record] of Object.entries(playerRatings)) {
-                if (record && record.username) {
-                    usernameToAddress.set(String(record.username).toLowerCase(), addr.toLowerCase());
-                }
+        const parsed = await storageLoadRatingsDoc();
+        if (!parsed) {
+            playerRatings = {};
+            await saveRatings();
+            return;
+        }
+        const clone = { ...parsed };
+        if (clone._meta && typeof clone._meta.totalGames === 'number') {
+            totalGamesPlayedCount = clone._meta.totalGames;
+            delete clone._meta;
+        }
+        playerRatings = clone;
+        for (const [addr, record] of Object.entries(playerRatings)) {
+            if (record && record.username && !GENERIC_NAMES.has(String(record.username).toLowerCase())) {
+                usernameToAddress.set(String(record.username).toLowerCase(), addr.toLowerCase());
             }
         }
+        console.log(`[RATINGS] Loaded ${Object.keys(playerRatings).length} player rating records.`);
     } catch (e) {
-        console.error("[RATINGS] Failed to parse ratings.json – resetting file.", e.message);
-        try { await fs.promises.unlink(RATINGS_FILE); } catch (_) {}
+        console.error("[RATINGS] Failed to load ratings – initializing clean store.", e.message);
         playerRatings = {};
         await saveRatings();
     }
@@ -214,16 +288,13 @@ async function saveRatings() {
                 _meta: { totalGames: totalGamesPlayedCount, updatedAt: Date.now() },
                 ...playerRatings
             };
-            const tmp = RATINGS_FILE + '.tmp';
-            await fs.promises.writeFile(tmp, JSON.stringify(payload, null, 2), 'utf8');
-            await fs.promises.rename(tmp, RATINGS_FILE);
+            await storageSaveRatingsDoc(payload);
         });
         await saveChain;
     } catch (e) {
         console.error("[RATINGS] Save failed:", e.message);
     }
 }
-loadRatings();
 
 function ensurePlayerRecord(addr) {
     addr = String(addr).toLowerCase();
@@ -242,14 +313,23 @@ function ensurePlayerRecord(addr) {
     return playerRatings[addr];
 }
 
+function ratingBucketForFormat(format) {
+    const f = String(format || 'blitz').toLowerCase();
+    if (f.startsWith('bullet')) return 'bullet';
+    if (f.startsWith('rapid')) return 'rapid';
+    return 'blitz';
+}
+
 function getRating(addr, format) {
     const rec = ensurePlayerRecord(addr);
-    return rec[format] || 2000;
+    const bucket = ratingBucketForFormat(format);
+    return rec[bucket] || 2000;
 }
 
 function setRating(addr, format, value) {
     const rec = ensurePlayerRecord(addr);
-    rec[format] = Math.max(100, Math.round(value));
+    const bucket = ratingBucketForFormat(format);
+    rec[bucket] = Math.max(100, Math.round(value));
 }
 
 function getRatingsObject(addr) {
@@ -265,23 +345,34 @@ function getRatingsObject(addr) {
     };
 }
 
+// =====================================================================
+// TIME CONTROL CONFIGURATION (Standard Lichess / Chess.com Formats)
+// Default Blitz is 3+0 (zero surprise increment); 3+2 & 5+0 explicitly available
+// =====================================================================
 const tcMap = {
-    bullet: { time: 60, inc: 0 },
-    blitz: { time: 180, inc: 2 },
-    rapid: { time: 600, inc: 0 }
+    bullet:   { time: 60,  inc: 0, name: 'bullet',   ratingBucket: 'bullet' },
+    blitz:    { time: 180, inc: 0, name: 'blitz',    ratingBucket: 'blitz'  },
+    blitz3_2: { time: 180, inc: 2, name: 'blitz3_2', ratingBucket: 'blitz'  },
+    blitz5:   { time: 300, inc: 0, name: 'blitz5',   ratingBucket: 'blitz'  },
+    rapid:    { time: 600, inc: 0, name: 'rapid',    ratingBucket: 'rapid'  }
 };
+
+function getTimeControlConfig(nameOrKey) {
+    const key = String(nameOrKey || 'blitz').toLowerCase();
+    return tcMap[key] || tcMap.blitz;
+}
 
 function getTimeControlFromIndex(index) {
     const byIndex = {
-        0: { time: 60, inc: 0, name: 'bullet' },
-        1: { time: 180, inc: 2, name: 'blitz' },
-        2: { time: 600, inc: 0, name: 'rapid' }
+        0: tcMap.bullet,
+        1: tcMap.blitz,
+        2: tcMap.rapid
     };
-    return byIndex[Number(index)] || byIndex[1];
+    return byIndex[Number(index)] || tcMap.blitz;
 }
 
 async function fetchUsername(address) {
-    if (!address) return "Guest";
+    if (!address) return null;
     const cleanAddr = String(address).toLowerCase();
     const rec = ensurePlayerRecord(cleanAddr);
     try {
@@ -292,8 +383,29 @@ async function fetchUsername(address) {
             return rec.username;
         }
     } catch (_) {}
-    if (rec.username) return rec.username;
+    if (rec.username && !GENERIC_NAMES.has(rec.username.toLowerCase())) return rec.username;
     return address.slice(0, 6) + "..." + address.slice(-4);
+}
+
+async function resolveParticipantName(rawName, wallet, guestId, sessionId) {
+    if (wallet && ethers.isAddress(wallet)) {
+        const onChain = await fetchUsername(wallet);
+        if (onChain && !GENERIC_NAMES.has(onChain.toLowerCase())) return onChain;
+    }
+    const cleaned = String(rawName || '').trim().slice(0, 24);
+    if (cleaned && !GENERIC_NAMES.has(cleaned.toLowerCase())) {
+        return cleaned;
+    }
+    const seed = String(guestId || sessionId || crypto.randomBytes(2).toString('hex'))
+        .replace(/[^a-zA-Z0-9]/g, '');
+    const suffix = (seed.slice(-4) || crypto.randomBytes(2).toString('hex')).toUpperCase();
+    return `Guest_${suffix}`;
+}
+
+function normalizeGuestId(rawGuestId, fallbackSessionId) {
+    const cleaned = String(rawGuestId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48);
+    if (cleaned.length >= 4) return cleaned;
+    return 'guest_' + String(fallbackSessionId || crypto.randomBytes(4).toString('hex')).slice(0, 12);
 }
 
 // =====================================================================
@@ -308,13 +420,14 @@ if (ALLOWED_ORIGINS.length === 0) {
 const MAX_CONN_PER_IP = 30;
 const MAX_ROOMS = 2000;
 const MAX_QUEUE_PER_TC = 500;
-const LAG_COMPENSATION_S = 0.12;
+const MAX_LAG_COMP_MS = 300;
+const DEFAULT_LAG_COMP_MS = 80;
 const OPENING_ABORT_SECONDS = 42; // 42s per opening ply once both players have joined
 
 const connsPerIp = new Map();
 const rooms = new Map();
 const tournaments = new Map();
-const freeQueues = { bullet: [], blitz: [], rapid: [] };
+const freeQueues = { bullet: [], blitz: [], blitz3_2: [], blitz5: [], rapid: [] };
 const clientMessageCounts = new Map();
 
 function evictCompletedRoomsIfNeeded() {
@@ -344,9 +457,6 @@ const MIME_TYPES = {
 const httpServer = http.createServer((req, res) => {
     const cleanUrl = (req.url || '/').split('?')[0];
 
-    // -----------------------------------------------------------------
-    // HEALTH CHECK ENDPOINT (used by uptime monitors / Render self-ping)
-    // -----------------------------------------------------------------
     if (cleanUrl === '/health') {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end('ok');
@@ -441,21 +551,64 @@ function broadcastToSpectators(matchId, payload, excludeWs = null) {
     });
 }
 
-function buildGameStateSnapshot(room) {
-    const verboseHistory = room.chess.history({ verbose: true });
-    let whiteUser = 'White';
-    let blackUser = 'Black';
-    for (const [, p] of room.players) {
-        if (p.color === 'w' && p.username) whiteUser = p.username;
-        if (p.color === 'b' && p.username) blackUser = p.username;
+// =====================================================================
+// AUTHORITATIVE MILLISECOND CLOCK ENGINE (ZERO DRIFT, SYMMETRICAL INC)
+// =====================================================================
+function getLiveClocksMs(room, now = Date.now()) {
+    let whiteMs = room.whiteTimeMs ?? ((room.whiteTime ?? 180) * 1000);
+    let blackMs = room.blackTimeMs ?? ((room.blackTime ?? 180) * 1000);
+
+    const clocksActive = !room.gameEnded &&
+        !chessIsGameOver(room.chess) &&
+        room.chess.history().length >= 2 &&
+        typeof room.turnStartedAt === 'number';
+
+    if (clocksActive) {
+        const elapsed = Math.max(0, now - room.turnStartedAt);
+        if (room.chess.turn() === 'w') {
+            whiteMs = Math.max(0, whiteMs - elapsed);
+        } else {
+            blackMs = Math.max(0, blackMs - elapsed);
+        }
     }
+
+    return { whiteMs, blackMs, clocksActive };
+}
+
+function msToSeconds(ms) {
+    return Math.max(0, Number((ms / 1000).toFixed(1)));
+}
+
+function getRoomPlayerNames(room) {
+    let whiteUser = room.whiteUsername || 'White';
+    let blackUser = room.blackUsername || 'Black';
+    for (const [, p] of room.players) {
+        if (p.color === 'w' && p.username && !GENERIC_NAMES.has(p.username.toLowerCase())) {
+            whiteUser = p.username;
+        }
+        if (p.color === 'b' && p.username && !GENERIC_NAMES.has(p.username.toLowerCase())) {
+            blackUser = p.username;
+        }
+    }
+    return { whiteUser, blackUser };
+}
+
+function buildGameStateSnapshot(room) {
+    const now = Date.now();
+    const { whiteMs, blackMs, clocksActive } = getLiveClocksMs(room, now);
+    const { whiteUser, blackUser } = getRoomPlayerNames(room);
+    const verboseHistory = room.chess.history({ verbose: true });
+
     return {
         type: 'GAME_STATE',
         fen: room.chess.fen(),
         moves: verboseHistory.map(m => ({ from: m.from, to: m.to, promotion: m.promotion || 'q', san: m.san })),
         turn: room.chess.turn(),
-        whiteTime: Math.max(0, Number((room.whiteTime ?? 180).toFixed(1))),
-        blackTime: Math.max(0, Number((room.blackTime ?? 180).toFixed(1))),
+        whiteTime: msToSeconds(whiteMs),
+        blackTime: msToSeconds(blackMs),
+        clocksActive,
+        inc: room.inc || 0,
+        serverNow: now,
         whiteWallet: room.whiteWallet,
         blackWallet: room.blackWallet,
         whiteUsername: whiteUser,
@@ -493,9 +646,11 @@ function syncRoomPlayerIdentities(room) {
 }
 
 // =====================================================================
-// 3B. SOCIAL SERVER ENGINE HOOKUP
+// 3B. ROOM FACTORY & SOCIAL SERVER ENGINE HOOKUP
 // =====================================================================
 function createRoomInstance(matchId, overrides = {}) {
+    const initialSec = overrides.whiteTime ?? 180;
+    const initialInc = overrides.inc ?? 0;
     return {
         matchId,
         clients: new Set(),
@@ -510,11 +665,19 @@ function createRoomInstance(matchId, overrides = {}) {
         challengePendingOpponent: false,
         whiteWallet: null,
         blackWallet: null,
+        whiteGuestId: null,
+        blackGuestId: null,
+        whiteUsername: null,
+        blackUsername: null,
         wagerEth: 0,
-        whiteTime: 180,
-        blackTime: 180,
-        inc: 2,
-        lastTick: Date.now(),
+        whiteTime: initialSec,
+        blackTime: initialSec,
+        whiteTimeMs: initialSec * 1000,
+        blackTimeMs: initialSec * 1000,
+        inc: initialInc,
+        incMs: initialInc * 1000,
+        turnStartedAt: null,
+        lastSyncBroadcastAt: 0,
         openingTimerStart: null,
         nonces: new Map(),
         drawOfferFrom: null,
@@ -534,17 +697,21 @@ const social = createSocialServer({
     fetchUsername,
     sendSafe,
     RESTRICTED_WORDS,
+    storage: externalStorage,
     createDirectFreeRoom: ({ whiteWallet, blackWallet, timeControl }) => {
         evictCompletedRoomsIfNeeded();
-        const tcCfg = tcMap[timeControl] || tcMap.blitz;
+        const tcCfg = getTimeControlConfig(timeControl);
         const matchId = "0x" + crypto.randomBytes(32).toString('hex');
         const room = createRoomInstance(matchId, {
             isPaidMode: false,
             isFreeMode: true,
             whiteTime: tcCfg.time,
             blackTime: tcCfg.time,
+            whiteTimeMs: tcCfg.time * 1000,
+            blackTimeMs: tcCfg.time * 1000,
             inc: tcCfg.inc,
-            timeControlName: timeControl || 'blitz',
+            incMs: tcCfg.inc * 1000,
+            timeControlName: tcCfg.name,
             whiteWallet: whiteWallet || null,
             blackWallet: blackWallet || null,
             openingTimerStart: null
@@ -565,7 +732,7 @@ async function updateRatingsAfterGame(whiteWallet, blackWallet, winnerWallet, ro
     }
     const cleanWhite = whiteWallet.toLowerCase();
     const cleanBlack = blackWallet.toLowerCase();
-    const format = room.timeControlName || 'blitz';
+    const format = ratingBucketForFormat(room.timeControlName);
 
     const recW = ensurePlayerRecord(cleanWhite);
     const recB = ensurePlayerRecord(cleanBlack);
@@ -629,7 +796,7 @@ function recordRoomOutcomeToSocial(room, matchId, winnerColor, winnerWallet, rea
             winnerWallet,
             winnerColor,
             reason,
-            timeControl: room.timeControlName,
+            timeControl: ratingBucketForFormat(room.timeControlName),
             isPaid: room.isPaidMode,
             wagerEth: room.wagerEth || 0,
             pgn: typeof room.chess.pgn === 'function' ? room.chess.pgn() : '',
@@ -785,7 +952,7 @@ class TransactionRelayer {
 const relayer = new TransactionRelayer(serverWallet);
 
 // =====================================================================
-// 6. ON-CHAIN ROOM VERIFIER & SERVER CLOCK / WATCHDOG ENGINE
+// 6. ON-CHAIN ROOM VERIFIER & 250ms AUTHORITATIVE CLOCK WATCHDOG
 // =====================================================================
 async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
     if (!room || room.onChainVerified) return true;
@@ -808,8 +975,11 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
                 if (room.chess.history().length === 0) {
                     room.whiteTime = tcConfig.time;
                     room.blackTime = tcConfig.time;
+                    room.whiteTimeMs = tcConfig.time * 1000;
+                    room.blackTimeMs = tcConfig.time * 1000;
                 }
                 room.inc = tcConfig.inc;
+                room.incMs = tcConfig.inc * 1000;
                 room.timeControlName = tcConfig.name;
                 room.isPaidMode = true;
 
@@ -824,7 +994,6 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
                     room.blackWallet = blackWallet;
                     room.challengePendingOpponent = false;
                     room.onChainVerified = true;
-                    room.lastTick = Date.now();
 
                     console.log(`[ORACLE] Room verified on-chain – White: ${room.whiteWallet} | Black: ${room.blackWallet} | Wager: ${room.wagerEth} zkLTC`);
 
@@ -832,6 +1001,8 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
                         if (p.authenticated && (p.wallet === whiteWallet || p.wallet === blackWallet)) {
                             p.color = (p.wallet === whiteWallet) ? 'w' : 'b';
                             p.fixedColor = true;
+                            if (p.color === 'w') room.whiteUsername = p.username;
+                            else room.blackUsername = p.username;
                             sendSafe(p.ws, {
                                 type: 'WALLET_REGISTERED',
                                 color: p.color,
@@ -870,6 +1041,7 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
 function abortRoomAndRefund(room, matchId, reason = 'opening_timeout') {
     if (!room || room.gameEnded) return;
     room.gameEnded = true;
+    room.turnStartedAt = null;
     console.log(`[ORACLE] Aborting match ${matchId} (reason: ${reason}, isPaidMode: ${room.isPaidMode})`);
 
     if (room.isPaidMode && !room.txPending) {
@@ -886,6 +1058,7 @@ function abortRoomAndRefund(room, matchId, reason = 'opening_timeout') {
 function finalizeGameEnd(room, matchId, winnerColor, reason) {
     if (!room || room.gameEnded) return;
     room.gameEnded = true;
+    room.turnStartedAt = null;
 
     let winnerWallet = ethers.ZeroAddress;
     if (winnerColor === 'w') winnerWallet = room.whiteWallet || ethers.ZeroAddress;
@@ -912,14 +1085,41 @@ function finalizeGameEnd(room, matchId, winnerColor, reason) {
     });
 }
 
+function triggerFlagTimeout(room, matchId, flaggedColor) {
+    if (!room || room.gameEnded) return;
+
+    if (flaggedColor === 'w') {
+        room.whiteTimeMs = 0;
+        room.whiteTime = 0;
+    } else {
+        room.blackTimeMs = 0;
+        room.blackTime = 0;
+    }
+    room.turnStartedAt = null;
+
+    const opponentColor = flaggedColor === 'w' ? 'b' : 'w';
+    const opponentCanMate = hasSufficientMatingMaterial(room.chess, opponentColor);
+    const winnerColor = opponentCanMate ? opponentColor : null;
+    const reason = opponentCanMate ? 'timeout' : 'timeout_vs_insufficient_material';
+
+    broadcastToRoom(matchId, {
+        type: 'TIME_OUT',
+        winnerColor,
+        flaggedColor,
+        whiteTime: msToSeconds(room.whiteTimeMs),
+        blackTime: msToSeconds(room.blackTimeMs)
+    });
+    finalizeGameEnd(room, matchId, winnerColor, reason);
+}
+
+// Fast 250ms watchdog: catches timeouts instantly without drifting clocks
 setInterval(() => {
     const now = Date.now();
     rooms.forEach((room, matchId) => {
         if (room.gameEnded) return;
 
-        // Server-side Opening Move Watchdog: only counts once both players have joined (openingTimerStart !== null)
+        // Opening Move Watchdog: active once both players have joined until ply 2
         if (room.chess.history().length < 2) {
-            room.lastTick = now;
             if (room.openingTimerStart) {
                 const ageSeconds = (now - room.openingTimerStart) / 1000;
                 if (ageSeconds >= OPENING_ABORT_SECONDS && !room.txPending) {
@@ -929,53 +1129,60 @@ setInterval(() => {
             return;
         }
 
-        if (!chessIsGameOver(room.chess) && room.whiteTime !== undefined) {
-            const delta = (now - room.lastTick) / 1000;
-            room.lastTick = now;
+        if (chessIsGameOver(room.chess)) return;
 
-            if (room.chess.turn() === 'w') {
-                room.whiteTime -= delta;
-                if (room.whiteTime <= 0) {
-                    room.whiteTime = 0;
-                    const blackCanMate = hasSufficientMatingMaterial(room.chess, 'b');
-                    const winnerColor = blackCanMate ? 'b' : null;
-                    const reason = blackCanMate ? 'timeout' : 'timeout_vs_insufficient_material';
-                    broadcastToRoom(matchId, { type: 'TIME_OUT', winnerColor, flaggedColor: 'w' });
-                    finalizeGameEnd(room, matchId, winnerColor, reason);
-                    return;
-                }
-            } else {
-                room.blackTime -= delta;
-                if (room.blackTime <= 0) {
-                    room.blackTime = 0;
-                    const whiteCanMate = hasSufficientMatingMaterial(room.chess, 'w');
-                    const winnerColor = whiteCanMate ? 'w' : null;
-                    const reason = whiteCanMate ? 'timeout' : 'timeout_vs_insufficient_material';
-                    broadcastToRoom(matchId, { type: 'TIME_OUT', winnerColor, flaggedColor: 'b' });
-                    finalizeGameEnd(room, matchId, winnerColor, reason);
-                    return;
-                }
-            }
+        // Ensure turnStartedAt is initialized as soon as ply >= 2
+        if (!room.turnStartedAt) {
+            room.turnStartedAt = now;
+        }
 
+        const { whiteMs, blackMs, clocksActive } = getLiveClocksMs(room, now);
+
+        if (room.chess.turn() === 'w' && whiteMs <= 0) {
+            triggerFlagTimeout(room, matchId, 'w');
+            return;
+        }
+        if (room.chess.turn() === 'b' && blackMs <= 0) {
+            triggerFlagTimeout(room, matchId, 'b');
+            return;
+        }
+
+        // Sync every 250ms when in time trouble (<10s), otherwise every 1000ms
+        const lowTime = whiteMs < 10000 || blackMs < 10000;
+        const syncInterval = lowTime ? 250 : 1000;
+        if (now - (room.lastSyncBroadcastAt || 0) >= syncInterval) {
+            room.lastSyncBroadcastAt = now;
             broadcastToRoom(matchId, {
                 type: 'CLOCK_SYNC',
-                whiteTime: Math.max(0, Number(room.whiteTime.toFixed(1))),
-                blackTime: Math.max(0, Number(room.blackTime.toFixed(1))),
-                turn: room.chess.turn()
+                whiteTime: msToSeconds(whiteMs),
+                blackTime: msToSeconds(blackMs),
+                turn: room.chess.turn(),
+                clocksActive,
+                inc: room.inc || 0,
+                serverNow: now
             });
-        } else {
-            room.lastTick = now;
         }
     });
-}, 1000);
+}, 250);
 
 function noop() {}
-function heartbeat() { this.isAlive = true; }
+function heartbeat() {
+    this.isAlive = true;
+    if (this._pingSentAt) {
+        const measured = Date.now() - this._pingSentAt;
+        if (measured >= 0 && measured < 5000) {
+            this.rttMs = this.rttMs ? Math.round((this.rttMs * 0.6) + (measured * 0.4)) : measured;
+        }
+        this._pingSentAt = null;
+    }
+}
 
 const heartbeatInterval = setInterval(() => {
+    const now = Date.now();
     server.clients.forEach((ws) => {
         if (ws.isAlive === false) return ws.terminate();
         ws.isAlive = false;
+        ws._pingSentAt = now;
         ws.ping(noop);
     });
 
@@ -1005,7 +1212,7 @@ const heartbeatInterval = setInterval(() => {
             tournaments.delete(tourneyId);
         }
     });
-}, 30000);
+}, 20000);
 
 // =====================================================================
 // 7. TOURNAMENT ARENA COORDINATOR
@@ -1105,31 +1312,36 @@ function pairAvailableTournamentPlayers(tourneyId) {
         if (p1Rec) p1Rec.inMatch = true;
         if (p2Rec) p2Rec.inMatch = true;
 
-        const tcCfg = tcMap[t.timeControl] || tcMap.blitz;
+        const tcCfg = getTimeControlConfig(t.timeControl);
         const matchId = "0x" + crypto.randomBytes(32).toString('hex');
         const room = createRoomInstance(matchId, {
             isPaidMode: false,
             isFreeMode: true,
-            timeControlName: t.timeControl,
+            timeControlName: tcCfg.name,
             whiteTime: tcCfg.time,
             blackTime: tcCfg.time,
+            whiteTimeMs: tcCfg.time * 1000,
+            blackTimeMs: tcCfg.time * 1000,
             inc: tcCfg.inc,
+            incMs: tcCfg.inc * 1000,
+            whiteUsername: p1.username,
+            blackUsername: p2.username,
             tourneyId,
             openingTimerStart: Date.now()
         });
 
         room.clients.add(p1.ws);
         room.clients.add(p2.ws);
-        room.players.set(p1.ws.sessionId, { ws: p1.ws, color: 'w', wallet: p1.wallet, authenticated: true, fixedColor: true, username: p1.username });
-        room.players.set(p2.ws.sessionId, { ws: p2.ws, color: 'b', wallet: p2.wallet, authenticated: true, fixedColor: true, username: p2.username });
-        room.whiteWallet = p1.wallet;
-        room.blackWallet = p2.wallet;
+        room.players.set(p1.ws.sessionId, { ws: p1.ws, color: 'w', wallet: p1.wallet, guestId: p1.guestId || null, authenticated: true, fixedColor: true, username: p1.username });
+        room.players.set(p2.ws.sessionId, { ws: p2.ws, color: 'b', wallet: p2.wallet, guestId: p2.guestId || null, authenticated: true, fixedColor: true, username: p2.username });
+        room.whiteWallet = ethers.isAddress(p1.wallet) ? p1.wallet : null;
+        room.blackWallet = ethers.isAddress(p2.wallet) ? p2.wallet : null;
         rooms.set(matchId, room);
 
-        sendSafe(p1.ws, { type: 'FREE_MATCH_FOUND', matchId, color: 'w', tourneyId, sessionId: p1.ws.sessionId, opponentName: p2.username });
-        sendSafe(p2.ws, { type: 'FREE_MATCH_FOUND', matchId, color: 'b', tourneyId, sessionId: p2.ws.sessionId, opponentName: p1.username });
-        social.notifyPresenceChange(p1.wallet);
-        social.notifyPresenceChange(p2.wallet);
+        sendSafe(p1.ws, { type: 'FREE_MATCH_FOUND', matchId, color: 'w', tourneyId, sessionId: p1.ws.sessionId, timeControl: tcCfg.name, myName: p1.username, opponentName: p2.username });
+        sendSafe(p2.ws, { type: 'FREE_MATCH_FOUND', matchId, color: 'b', tourneyId, sessionId: p2.ws.sessionId, timeControl: tcCfg.name, myName: p2.username, opponentName: p1.username });
+        if (room.whiteWallet) social.notifyPresenceChange(room.whiteWallet);
+        if (room.blackWallet) social.notifyPresenceChange(room.blackWallet);
     }
 }
 
@@ -1148,7 +1360,10 @@ server.on('connection', (ws, req) => {
     ws.sessionId = crypto.randomBytes(16).toString('hex');
     ws._rateLimitKey = ws.sessionId;
     ws.isAlive = true;
+    ws.rttMs = DEFAULT_LAG_COMP_MS * 2;
+    ws._pingSentAt = Date.now();
     ws.on('pong', heartbeat);
+    try { ws.ping(noop); } catch (_) {}
 
     let currentMatchId = null;
 
@@ -1210,7 +1425,7 @@ server.on('connection', (ws, req) => {
                 return;
             }
 
-            // ---------- LEGACY SINGLE-RESULT PLAYER SEARCH (Kept backward-compatible, fixed false positives) ----------
+            // ---------- LEGACY SINGLE-RESULT PLAYER SEARCH ----------
             if (type === 'SEARCH_USER') {
                 const query = String(message.query || '').trim().toLowerCase();
                 if (!query) return;
@@ -1274,23 +1489,21 @@ server.on('connection', (ws, req) => {
             // ---------- TOURNAMENT ARENA (ZERO-TRUST DEPOSIT VERIFIED) ----------
             if (type === 'CREATE_OR_JOIN_TOURNEY') {
                 const tourneyId = String(message.tourneyId || 'litforge-main-arena').trim().toLowerCase();
-                const wallet = String(message.wallet || '').toLowerCase();
-                if (!wallet) {
-                    sendSafe(ws, { type: 'ERROR', reason: 'Connect your Web3 wallet to join a tournament.' });
-                    return;
-                }
+                const rawWallet = String(message.wallet || '').toLowerCase();
+                const guestId = normalizeGuestId(message.guestId, ws.sessionId);
+                const participantKey = rawWallet || guestId;
 
                 let t = tournaments.get(tourneyId);
                 const wantPaid = t ? t.isPaid : !!message.isPaid;
 
                 if (wantPaid) {
-                    if (!ethers.isAddress(wallet)) {
+                    if (!ethers.isAddress(rawWallet)) {
                         sendSafe(ws, { type: 'ERROR', reason: 'Valid Web3 wallet required for staked tournaments.' });
                         return;
                     }
                     try {
                         const tourneyBytes32 = ethers.id(tourneyId);
-                        const hasPaidEntry = await escrowContract.tournamentParticipants(tourneyBytes32, wallet);
+                        const hasPaidEntry = await escrowContract.tournamentParticipants(tourneyBytes32, rawWallet);
                         if (!hasPaidEntry) {
                             sendSafe(ws, { type: 'ERROR', reason: 'On-chain tournament entry deposit not verified.' });
                             return;
@@ -1301,13 +1514,20 @@ server.on('connection', (ws, req) => {
                     }
                 }
 
-                const username = message.username || await fetchUsername(wallet);
+                const username = await resolveParticipantName(
+                    message.username,
+                    ethers.isAddress(rawWallet) ? rawWallet : null,
+                    guestId,
+                    ws.sessionId
+                );
+
+                const tcCfg = getTimeControlConfig(message.timeControl);
                 if (!t) {
                     t = {
                         id: tourneyId,
                         name: message.name || `Arena #${tourneyId.slice(0, 8)}`,
                         entryFee: message.entryFee || '0.01',
-                        timeControl: ['bullet', 'blitz', 'rapid'].includes(message.timeControl) ? message.timeControl : 'blitz',
+                        timeControl: tcCfg.name,
                         isPaid: wantPaid,
                         status: 'active',
                         players: new Map(),
@@ -1316,13 +1536,13 @@ server.on('connection', (ws, req) => {
                     tournaments.set(tourneyId, t);
                 }
 
-                if (!t.players.has(wallet)) {
-                    t.players.set(wallet, { ws, username, points: 0, wins: 0, games: 0, inMatch: false });
-                    if (ethers.isAddress(wallet)) {
-                        social.emitActivityEvent(wallet, 'tournament', `entered Tournament Arena "${t.name}"`);
+                if (!t.players.has(participantKey)) {
+                    t.players.set(participantKey, { ws, username, guestId, points: 0, wins: 0, games: 0, inMatch: false });
+                    if (ethers.isAddress(rawWallet)) {
+                        social.emitActivityEvent(rawWallet, 'tournament', `entered Tournament Arena "${t.name}"`);
                     }
                 } else {
-                    const existing = t.players.get(wallet);
+                    const existing = t.players.get(participantKey);
                     existing.ws = ws;
                     existing.username = username;
                 }
@@ -1334,15 +1554,21 @@ server.on('connection', (ws, req) => {
 
             // ---------- FREE MATCHMAKING ----------
             if (type === 'QUEUE_FREE_MATCH') {
-                const timeControl = Object.keys(freeQueues).includes(message.timeControl) ? message.timeControl : 'blitz';
+                const tcCfg = getTimeControlConfig(message.timeControl);
+                const timeControl = tcCfg.name;
                 const sidePref = Number(message.sidePref ?? 2);
-                const wallet = message.wallet ? String(message.wallet).toLowerCase() : null;
-                const username = message.username
-                    ? String(message.username).slice(0, 32)
-                    : (wallet ? await fetchUsername(wallet) : "Guest_" + ws.sessionId.slice(0, 4));
+                const wallet = (message.wallet && ethers.isAddress(message.wallet))
+                    ? String(message.wallet).toLowerCase()
+                    : null;
+                const guestId = normalizeGuestId(message.guestId, ws.sessionId);
+                const username = await resolveParticipantName(message.username, wallet, guestId, ws.sessionId);
 
                 for (const tc of Object.keys(freeQueues)) {
-                    freeQueues[tc] = freeQueues[tc].filter(e => e.ws !== ws && (!wallet || e.wallet !== wallet));
+                    freeQueues[tc] = freeQueues[tc].filter(e =>
+                        e.ws !== ws &&
+                        (!wallet || e.wallet !== wallet) &&
+                        (!guestId || e.guestId !== guestId)
+                    );
                 }
 
                 const queue = freeQueues[timeControl];
@@ -1351,8 +1577,8 @@ server.on('connection', (ws, req) => {
                     return;
                 }
 
-                queue.push({ ws, timeControl, sidePref, wallet, username, queuedAt: Date.now() });
-                sendSafe(ws, { type: 'QUEUED_FREE_MATCH', timeControl, queueSize: queue.length });
+                queue.push({ ws, timeControl, sidePref, wallet, guestId, username, queuedAt: Date.now() });
+                sendSafe(ws, { type: 'QUEUED_FREE_MATCH', timeControl, queueSize: queue.length, username });
 
                 if (queue.length >= 2) {
                     const p1 = queue.shift();
@@ -1367,7 +1593,6 @@ server.on('connection', (ws, req) => {
                         return;
                     }
 
-                    const roomTcConfig = tcMap[timeControl] || tcMap.blitz;
                     const newMatchId = "0x" + crypto.randomBytes(32).toString('hex');
 
                     let p1Color = 'w';
@@ -1382,12 +1607,19 @@ server.on('connection', (ws, req) => {
                     const room = createRoomInstance(newMatchId, {
                         isPaidMode: false,
                         isFreeMode: true,
-                        whiteTime: roomTcConfig.time,
-                        blackTime: roomTcConfig.time,
-                        inc: roomTcConfig.inc,
+                        whiteTime: tcCfg.time,
+                        blackTime: tcCfg.time,
+                        whiteTimeMs: tcCfg.time * 1000,
+                        blackTimeMs: tcCfg.time * 1000,
+                        inc: tcCfg.inc,
+                        incMs: tcCfg.inc * 1000,
                         timeControlName: timeControl,
                         whiteWallet: p1Color === 'w' ? p1.wallet : p2.wallet,
                         blackWallet: p1Color === 'w' ? p2.wallet : p1.wallet,
+                        whiteGuestId: p1Color === 'w' ? p1.guestId : p2.guestId,
+                        blackGuestId: p1Color === 'w' ? p2.guestId : p1.guestId,
+                        whiteUsername: p1Color === 'w' ? p1.username : p2.username,
+                        blackUsername: p1Color === 'w' ? p2.username : p1.username,
                         openingTimerStart: Date.now()
                     });
 
@@ -1398,6 +1630,7 @@ server.on('connection', (ws, req) => {
                         ws: p1.ws,
                         color: p1Color,
                         wallet: p1.wallet,
+                        guestId: p1.guestId,
                         authenticated: true,
                         fixedColor: true,
                         username: p1.username
@@ -1407,6 +1640,7 @@ server.on('connection', (ws, req) => {
                         ws: p2.ws,
                         color: p2Color,
                         wallet: p2.wallet,
+                        guestId: p2.guestId,
                         authenticated: true,
                         fixedColor: true,
                         username: p2.username
@@ -1420,6 +1654,7 @@ server.on('connection', (ws, req) => {
                         color: p1Color,
                         sessionId: p1.ws.sessionId,
                         timeControl,
+                        myName: p1.username,
                         opponentName: p2.username
                     });
 
@@ -1429,6 +1664,7 @@ server.on('connection', (ws, req) => {
                         color: p2Color,
                         sessionId: p2.ws.sessionId,
                         timeControl,
+                        myName: p2.username,
                         opponentName: p1.username
                     });
 
@@ -1454,12 +1690,17 @@ server.on('connection', (ws, req) => {
                     isPaidMode: isPaid,
                     spectate,
                     timeControlVal,
+                    timeControlName: reqTcName,
                     username: clientUsername,
-                    wallet: rawClientWallet
+                    wallet: rawClientWallet,
+                    guestId: rawGuestId
                 } = message;
                 if (!matchId) return;
                 currentMatchId = matchId;
-                const clientWallet = rawClientWallet ? String(rawClientWallet).toLowerCase() : null;
+                const clientWallet = (rawClientWallet && ethers.isAddress(rawClientWallet))
+                    ? String(rawClientWallet).toLowerCase()
+                    : null;
+                const clientGuestId = normalizeGuestId(rawGuestId, ws.sessionId);
 
                 evictCompletedRoomsIfNeeded();
                 if (rooms.size >= MAX_ROOMS && !rooms.has(matchId)) {
@@ -1469,13 +1710,16 @@ server.on('connection', (ws, req) => {
 
                 let room = rooms.get(matchId);
                 if (!room) {
-                    const tcInfo = getTimeControlFromIndex(timeControlVal ?? 1);
+                    const tcInfo = reqTcName ? getTimeControlConfig(reqTcName) : getTimeControlFromIndex(timeControlVal ?? 1);
                     room = createRoomInstance(matchId, {
                         isPaidMode: !!isPaid,
                         isFreeMode: !isPaid,
                         whiteTime: tcInfo.time,
                         blackTime: tcInfo.time,
+                        whiteTimeMs: tcInfo.time * 1000,
+                        blackTimeMs: tcInfo.time * 1000,
                         inc: tcInfo.inc,
+                        incMs: tcInfo.inc * 1000,
                         timeControlName: tcInfo.name
                     });
                     rooms.set(matchId, room);
@@ -1488,7 +1732,7 @@ server.on('connection', (ws, req) => {
 
                 if (spectate) {
                     room.spectators.add(ws.sessionId);
-                    ws._spectatorName = clientUsername || (clientWallet ? social.getDisplayName(clientWallet) : ("Railbird_" + ws.sessionId.slice(0, 4)));
+                    ws._spectatorName = await resolveParticipantName(clientUsername, clientWallet, clientGuestId, ws.sessionId);
                     sendSafe(ws, { type: 'SPECTATOR_MODE', matchId, sessionId: ws.sessionId });
                     sendSafe(ws, buildGameStateSnapshot(room));
                     return;
@@ -1512,7 +1756,7 @@ server.on('connection', (ws, req) => {
                         clientWallet !== room.blackWallet
                     ) {
                         room.spectators.add(ws.sessionId);
-                        ws._spectatorName = clientUsername || social.getDisplayName(clientWallet);
+                        ws._spectatorName = await resolveParticipantName(clientUsername, clientWallet, clientGuestId, ws.sessionId);
                         sendSafe(ws, { type: 'SPECTATOR_MODE', matchId, sessionId: ws.sessionId });
                         sendSafe(ws, buildGameStateSnapshot(room));
                         return;
@@ -1537,16 +1781,18 @@ server.on('connection', (ws, req) => {
                 }
 
                 // =========================================================
-                // FREE MODE: Session Reclaim & Player Assignment
+                // FREE MODE: Reliable Session Reclaim (Wallet + GuestId)
                 // =========================================================
+                const resolvedName = await resolveParticipantName(clientUsername, clientWallet, clientGuestId, ws.sessionId);
                 let existingPlayer = room.players.get(ws.sessionId);
 
                 if (!existingPlayer) {
                     for (const [sid, p] of [...room.players.entries()]) {
                         const sameWallet = clientWallet && p.wallet && p.wallet.toLowerCase() === clientWallet;
+                        const sameGuest = clientGuestId && p.guestId && p.guestId === clientGuestId;
                         const deadSocketSameColor = (!p.ws || p.ws.readyState !== WebSocket.OPEN) && (!color || p.color === color);
 
-                        if (sameWallet || deadSocketSameColor) {
+                        if (sameWallet || sameGuest || deadSocketSameColor) {
                             if (p.disconnectTimer) {
                                 clearTimeout(p.disconnectTimer);
                                 p.disconnectTimer = null;
@@ -1559,7 +1805,8 @@ server.on('connection', (ws, req) => {
                                 ...p,
                                 ws,
                                 wallet: clientWallet || p.wallet,
-                                username: clientUsername || p.username
+                                guestId: clientGuestId || p.guestId,
+                                username: (p.username && !GENERIC_NAMES.has(p.username.toLowerCase())) ? p.username : resolvedName
                             };
                             room.players.delete(sid);
                             room.players.set(ws.sessionId, existingPlayer);
@@ -1583,7 +1830,7 @@ server.on('connection', (ws, req) => {
 
                 if (!existingPlayer && room.players.size >= 2) {
                     room.spectators.add(ws.sessionId);
-                    ws._spectatorName = clientUsername || (clientWallet ? social.getDisplayName(clientWallet) : ("Railbird_" + ws.sessionId.slice(0, 4)));
+                    ws._spectatorName = resolvedName;
                     sendSafe(ws, { type: 'SPECTATOR_MODE', matchId, sessionId: ws.sessionId });
                     sendSafe(ws, buildGameStateSnapshot(room));
                     return;
@@ -1594,6 +1841,9 @@ server.on('connection', (ws, req) => {
                     let assignedColor = color;
                     if (clientWallet && room.whiteWallet && clientWallet === room.whiteWallet) assignedColor = 'w';
                     else if (clientWallet && room.blackWallet && clientWallet === room.blackWallet) assignedColor = 'b';
+                    else if (clientGuestId && room.whiteGuestId && clientGuestId === room.whiteGuestId) assignedColor = 'w';
+                    else if (clientGuestId && room.blackGuestId && clientGuestId === room.blackGuestId) assignedColor = 'b';
+
                     if (!assignedColor || takenColors.includes(assignedColor)) {
                         assignedColor = takenColors.includes('w') ? 'b' : 'w';
                     }
@@ -1601,14 +1851,18 @@ server.on('connection', (ws, req) => {
                         ws,
                         color: assignedColor,
                         wallet: clientWallet,
+                        guestId: clientGuestId,
                         authenticated: true,
-                        username: clientUsername || (assignedColor === 'w' ? 'White' : 'Black'),
+                        username: resolvedName,
                         fixedColor: !!color
                     });
                 } else {
                     existingPlayer.ws = ws;
                     if (clientWallet) existingPlayer.wallet = clientWallet;
-                    if (clientUsername) existingPlayer.username = clientUsername;
+                    if (clientGuestId) existingPlayer.guestId = clientGuestId;
+                    if (!existingPlayer.username || GENERIC_NAMES.has(existingPlayer.username.toLowerCase())) {
+                        existingPlayer.username = resolvedName;
+                    }
                     if (existingPlayer.disconnectTimer) {
                         clearTimeout(existingPlayer.disconnectTimer);
                         existingPlayer.disconnectTimer = null;
@@ -1616,9 +1870,14 @@ server.on('connection', (ws, req) => {
                 }
 
                 const myPlayer = room.players.get(ws.sessionId);
-                if (myPlayer.wallet) {
-                    if (myPlayer.color === 'w' && !room.whiteWallet) room.whiteWallet = myPlayer.wallet;
-                    if (myPlayer.color === 'b' && !room.blackWallet) room.blackWallet = myPlayer.wallet;
+                if (myPlayer.color === 'w') {
+                    if (myPlayer.wallet && !room.whiteWallet) room.whiteWallet = myPlayer.wallet;
+                    if (myPlayer.guestId && !room.whiteGuestId) room.whiteGuestId = myPlayer.guestId;
+                    room.whiteUsername = myPlayer.username;
+                } else {
+                    if (myPlayer.wallet && !room.blackWallet) room.blackWallet = myPlayer.wallet;
+                    if (myPlayer.guestId && !room.blackGuestId) room.blackGuestId = myPlayer.guestId;
+                    room.blackUsername = myPlayer.username;
                 }
 
                 if (room.players.size === 2 && !room.openingTimerStart) {
@@ -1630,6 +1889,7 @@ server.on('connection', (ws, req) => {
                     nonce,
                     sessionId: ws.sessionId,
                     color: myPlayer.color,
+                    username: myPlayer.username,
                     isPaidMode: false,
                     authenticated: true
                 });
@@ -1694,6 +1954,7 @@ server.on('connection', (ws, req) => {
 
                         if (room.challengePendingOpponent && room.whiteWallet === recovered && !room.blackWallet) {
                             const resolvedCreatorName = await fetchUsername(recovered);
+                            room.whiteUsername = resolvedCreatorName;
                             room.players.set(ws.sessionId, {
                                 ws,
                                 color: 'w',
@@ -1793,6 +2054,8 @@ server.on('connection', (ws, req) => {
                         if (player.color === 'w') room.whiteWallet = recovered;
                         else room.blackWallet = recovered;
                     }
+                    if (player.color === 'w') room.whiteUsername = resolvedUsername;
+                    else room.blackUsername = resolvedUsername;
 
                     room.players.set(ws.sessionId, player);
                     room.spectators.delete(ws.sessionId);
@@ -1820,7 +2083,37 @@ server.on('connection', (ws, req) => {
                 return;
             }
 
-            // ---------- CHESS MOVE ----------
+            // ---------- INSTANT CLIENT TIMEOUT CLAIM / CLOCK CHECK ----------
+            if (type === 'CLAIM_TIMEOUT' || type === 'CHECK_CLOCK') {
+                if (!currentMatchId) return;
+                const room = rooms.get(currentMatchId);
+                if (!room || room.gameEnded) return;
+                if (room.chess.history().length < 2) return;
+
+                const now = Date.now();
+                const { whiteMs, blackMs, clocksActive } = getLiveClocksMs(room, now);
+                if (room.chess.turn() === 'w' && whiteMs <= 0) {
+                    triggerFlagTimeout(room, currentMatchId, 'w');
+                    return;
+                }
+                if (room.chess.turn() === 'b' && blackMs <= 0) {
+                    triggerFlagTimeout(room, currentMatchId, 'b');
+                    return;
+                }
+
+                sendSafe(ws, {
+                    type: 'CLOCK_SYNC',
+                    whiteTime: msToSeconds(whiteMs),
+                    blackTime: msToSeconds(blackMs),
+                    turn: room.chess.turn(),
+                    clocksActive,
+                    inc: room.inc || 0,
+                    serverNow: now
+                });
+                return;
+            }
+
+            // ---------- CHESS MOVE (STRICT FLAG CHECK + FAIR LAG COMP + SYMMETRICAL INC) ----------
             if (type === 'CHESS_MOVE') {
                 if (!currentMatchId) return;
                 const room = rooms.get(currentMatchId);
@@ -1841,13 +2134,36 @@ server.on('connection', (ws, req) => {
                 }
 
                 const now = Date.now();
-                if (room.chess.history().length >= 2) {
-                    const elapsed = Math.max(0, ((now - room.lastTick) / 1000) - LAG_COMPENSATION_S);
-                    if (player.color === 'w') room.whiteTime = Math.max(0, room.whiteTime - elapsed);
-                    else room.blackTime = Math.max(0, room.blackTime - elapsed);
-                }
-                room.lastTick = now;
+                const plyBeforeMove = room.chess.history().length;
 
+                // 1. Check timeout BEFORE applying the move (only once clocks are actively running: ply >= 2)
+                if (plyBeforeMove >= 2 && room.turnStartedAt) {
+                    const oneWayCompMs = Math.min(
+                        MAX_LAG_COMP_MS,
+                        Math.max(0, Math.round((ws.rttMs || (DEFAULT_LAG_COMP_MS * 2)) / 2))
+                    );
+                    const rawElapsedMs = Math.max(0, now - room.turnStartedAt);
+                    const effectiveElapsedMs = Math.max(0, rawElapsedMs - oneWayCompMs);
+
+                    const currentRemainingMs = player.color === 'w' ? room.whiteTimeMs : room.blackTimeMs;
+                    const updatedRemainingMs = currentRemainingMs - effectiveElapsedMs;
+
+                    if (updatedRemainingMs <= 0) {
+                        // Flagged before the move arrived — reject move & end game by FIDE timeout
+                        triggerFlagTimeout(room, currentMatchId, player.color);
+                        return;
+                    }
+
+                    if (player.color === 'w') {
+                        room.whiteTimeMs = updatedRemainingMs;
+                        room.whiteTime = msToSeconds(room.whiteTimeMs);
+                    } else {
+                        room.blackTimeMs = updatedRemainingMs;
+                        room.blackTime = msToSeconds(room.blackTimeMs);
+                    }
+                }
+
+                // 2. Validate & apply move on authoritative board
                 let move = null;
                 try {
                     if (typeof message.from !== 'string' || typeof message.to !== 'string') throw new Error('bad input');
@@ -1863,17 +2179,35 @@ server.on('connection', (ws, req) => {
                 }
 
                 room.drawOfferFrom = null;
+                const plyAfterMove = room.chess.history().length;
 
-                if (room.chess.history().length === 1) {
+                // 3. Symmetrical Lichess/Chess.com Clock Transitions:
+                // - Ply 1 (White move 1): clocks still paused; reset opening abort timer for Black
+                // - Ply 2 (Black move 1): clocks start NOW (turnStartedAt = now); NO free +inc on move 1
+                // - Ply 3+ (White move 2+): clocks running; add +incMs symmetrically to the mover
+                if (plyAfterMove === 1) {
                     room.openingTimerStart = now;
-                } else if (room.chess.history().length >= 2) {
+                    room.turnStartedAt = null;
+                } else if (plyAfterMove === 2) {
                     room.openingTimerStart = null;
+                    room.turnStartedAt = now;
+                } else {
+                    if (room.incMs > 0) {
+                        if (player.color === 'w') {
+                            room.whiteTimeMs += room.incMs;
+                            room.whiteTime = msToSeconds(room.whiteTimeMs);
+                        } else {
+                            room.blackTimeMs += room.incMs;
+                            room.blackTime = msToSeconds(room.blackTimeMs);
+                        }
+                    }
+                    room.turnStartedAt = now;
                 }
 
-                if (room.chess.history().length > 1) {
-                    if (player.color === 'w') room.whiteTime += room.inc;
-                    else room.blackTime += room.inc;
-                }
+                room.lastSyncBroadcastAt = now;
+                const clocksActive = plyAfterMove >= 2 && !chessIsGameOver(room.chess);
+                const wSec = msToSeconds(room.whiteTimeMs);
+                const bSec = msToSeconds(room.blackTimeMs);
 
                 broadcastToRoom(currentMatchId, {
                     type: 'OPPONENT_MOVE',
@@ -1883,15 +2217,22 @@ server.on('connection', (ws, req) => {
                     promotion: move.promotion || 'q',
                     san: move.san,
                     fen: room.chess.fen(),
-                    whiteTime: Math.max(0, Number(room.whiteTime.toFixed(1))),
-                    blackTime: Math.max(0, Number(room.blackTime.toFixed(1)))
+                    whiteTime: wSec,
+                    blackTime: bSec,
+                    turn: room.chess.turn(),
+                    clocksActive,
+                    inc: room.inc || 0,
+                    serverNow: now
                 }, ws);
 
                 sendSafe(ws, {
                     type: 'CLOCK_SYNC',
-                    whiteTime: Math.max(0, Number(room.whiteTime.toFixed(1))),
-                    blackTime: Math.max(0, Number(room.blackTime.toFixed(1))),
-                    turn: room.chess.turn()
+                    whiteTime: wSec,
+                    blackTime: bSec,
+                    turn: room.chess.turn(),
+                    clocksActive,
+                    inc: room.inc || 0,
+                    serverNow: now
                 });
 
                 if (chessIsGameOver(room.chess)) {
@@ -1975,7 +2316,7 @@ server.on('connection', (ws, req) => {
                 return;
             }
 
-            // ---------- SPECTATOR LOUNGE / RAILBIRD CHAT (Isolated from players!) ----------
+            // ---------- SPECTATOR LOUNGE / RAILBIRD CHAT ----------
             if (type === 'SPECTATOR_CHAT') {
                 if (!currentMatchId) return;
                 const room = rooms.get(currentMatchId);
@@ -2086,22 +2427,33 @@ server.on('connection', (ws, req) => {
 
 server.on('close', () => clearInterval(heartbeatInterval));
 
-httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 LitChess Web App & WebSocket Oracle live at: http://localhost:${PORT}`);
-
-    // =================================================================
-    // RENDER KEEP-ALIVE SELF-PING (prevents free-tier dyno sleep)
-    // Render automatically injects RENDER_EXTERNAL_URL in production.
-    // =================================================================
-    const SELF_URL = process.env.RENDER_EXTERNAL_URL;
-    if (SELF_URL) {
-        console.log(`[KEEPALIVE] Self-ping enabled → ${SELF_URL}/health every 10 min`);
-        setInterval(() => {
-            http.get(`${SELF_URL}/health`, r => r.resume()).on('error', () => {});
-        }, 10 * 60 * 1000);
-    } else {
-        console.log('[KEEPALIVE] RENDER_EXTERNAL_URL not set – self-ping disabled (local/dev mode).');
+// =====================================================================
+// 9. BOOT SEQUENCE (Initialize Storage -> Load Ratings -> Listen)
+// =====================================================================
+(async function bootServer() {
+    await initExternalStorage();
+    await loadRatings();
+    if (typeof social.loadDb === 'function') {
+        await social.loadDb();
     }
-});
+
+    httpServer.listen(PORT, '0.0.0.0', () => {
+        console.log(`🚀 LitChess Web App & WebSocket Oracle live at: http://localhost:${PORT}`);
+
+        // =================================================================
+        // RENDER KEEP-ALIVE SELF-PING (Uses https for https:// URLs)
+        // =================================================================
+        const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+        if (SELF_URL) {
+            const clientLib = SELF_URL.startsWith('https://') ? https : http;
+            console.log(`[KEEPALIVE] Self-ping enabled → ${SELF_URL}/health every 10 min`);
+            setInterval(() => {
+                clientLib.get(`${SELF_URL}/health`, r => r.resume()).on('error', () => {});
+            }, 10 * 60 * 1000);
+        } else {
+            console.log('[KEEPALIVE] RENDER_EXTERNAL_URL not set – self-ping disabled (local/dev mode).');
+        }
+    });
+})();
 
 process.on('unhandledRejection', e => console.error('[UNHANDLED]', e));

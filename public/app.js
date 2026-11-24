@@ -20,7 +20,28 @@ function normalizeStake(raw) {
     return (s === '' || s === '0') ? null : s;
 }
 
-var myUsername = "Player";
+const GUEST_ID_KEY = 'litchess_guest_id';
+const GUEST_NAME_KEY = 'litchess_guest_name';
+
+function getOrCreateGuestIdentity() {
+    let gid = localStorage.getItem(GUEST_ID_KEY);
+    if (!gid || gid.length < 6) {
+        const randHex = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+        gid = 'guest_' + randHex;
+        localStorage.setItem(GUEST_ID_KEY, gid);
+    }
+    let gname = localStorage.getItem(GUEST_NAME_KEY);
+    if (!gname || ['player', 'guest', 'anon'].includes(gname.trim().toLowerCase())) {
+        gname = 'Guest_' + gid.slice(-4).toUpperCase();
+        localStorage.setItem(GUEST_NAME_KEY, gname);
+    }
+    return { guestId: gid, guestName: gname };
+}
+
+const guestIdentity = getOrCreateGuestIdentity();
+var myGuestId = guestIdentity.guestId;
+var myUsername = guestIdentity.guestName;
 var opponentUsername = "Opponent";
 var opponentWallet = null;
 var spectatorWhiteName = "White";
@@ -40,6 +61,7 @@ var createdChallengeMatchId = null;
 var pendingChallengeInvite = null;
 var signer = null;
 var p2pSocket = null;
+var p2pReconnectTimer = null;
 var lobbySocket = null;
 var lobbyReconnectTimer = null;
 var myAssignedColor = 'w';
@@ -56,6 +78,7 @@ var opponentDisconnectTimer = null;
 var isAuthenticated = false;
 var pendingPremoves = [];
 var selectedSquare = null;
+var lastTimeoutClaimAt = 0;
 
 const STORAGE_KEY = 'litchess_game_state';
 const SESSION_DELEGATE_PREFIX = 'litchess_delegate_auth_';
@@ -611,8 +634,8 @@ var analysisCurrentIndex = -1;
 
 var openingMoveTimer = null;
 var chessClockTicker = null;
-var timeControlLimits = { bullet: 60, blitz: 180, rapid: 600 };
-var timeControlIncrements = { bullet: 0, blitz: 2, rapid: 0 };
+var timeControlLimits = { bullet: 60, blitz: 180, blitz3_2: 180, blitz5: 300, rapid: 600 };
+var timeControlIncrements = { bullet: 0, blitz: 0, blitz3_2: 2, blitz5: 0, rapid: 0 };
 
 var userTimeRemaining = 180;
 var opponentTimeRemaining = 180;
@@ -992,7 +1015,7 @@ function displayHistoricalMoveIndex() {
 }
 
 // ============================================================================
-// 8. CLOCK ENGINE (ISOLATED FOR BOTH PLAYERS & SPECTATORS)
+// 8. CLOCK ENGINE (LICHESS / CHESS.COM AUTHORITATIVE SYNC + INSTANT FLAG CLAIM)
 // ============================================================================
 function formatSecondsToDigitalString(totalSeconds) {
     if (totalSeconds <= 0) return "00:00";
@@ -1005,8 +1028,40 @@ function formatSecondsToDigitalString(totalSeconds) {
     return (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
 }
 
+function repaintBothClocks() {
+    $('#user-clock').text(formatSecondsToDigitalString(userTimeRemaining));
+    $('#opponent-clock').text(formatSecondsToDigitalString(opponentTimeRemaining));
+}
+
+function syncClocksFromServerPayload(data) {
+    if (!data || data.whiteTime === undefined || data.blackTime === undefined) return;
+    const bottomIsWhite = isSpectator ? true : (myAssignedColor === 'w');
+    userTimeRemaining = Math.max(0, Number(bottomIsWhite ? data.whiteTime : data.blackTime));
+    opponentTimeRemaining = Math.max(0, Number(bottomIsWhite ? data.blackTime : data.whiteTime));
+    repaintBothClocks();
+    updateActiveClockGlow();
+}
+
+function sendTimeoutClaimIfDue() {
+    if (currentMode === 'solo' || gameResultSettled || !isMatchActive) return;
+    if (game.history().length < 2) return;
+    const now = Date.now();
+    if (now - lastTimeoutClaimAt < 800) return;
+    lastTimeoutClaimAt = now;
+
+    if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
+        p2pSocket.send(JSON.stringify({ type: 'CLAIM_TIMEOUT' }));
+    } else if (activeMatchId) {
+        establishP2PConnection(activeMatchId, true, true);
+    }
+}
+
 function updateActiveClockGlow() {
     if (!isMatchActive || gameResultSettled) {
+        $('#user-clock, #opponent-clock').removeClass('clock-running');
+        return;
+    }
+    if (currentMode !== 'solo' && game.history().length < 2) {
         $('#user-clock, #opponent-clock').removeClass('clock-running');
         return;
     }
@@ -1044,16 +1099,24 @@ function runChessClockEngine() {
         if (bottomColor === game.turn()) {
             userTimeRemaining = Math.max(0, userTimeRemaining - dt);
             $('#user-clock').text(formatSecondsToDigitalString(userTimeRemaining));
-            if (userTimeRemaining <= 0 && currentMode === 'solo') {
-                $('#user-clock').text("00:00").addClass('clock-flagged').removeClass('clock-running');
-                handleMatchCompletion('loss', 'timeout');
+            if (userTimeRemaining <= 0) {
+                if (currentMode === 'solo') {
+                    $('#user-clock').text("00:00").addClass('clock-flagged').removeClass('clock-running');
+                    handleMatchCompletion('loss', 'timeout');
+                } else {
+                    sendTimeoutClaimIfDue();
+                }
             }
         } else {
             opponentTimeRemaining = Math.max(0, opponentTimeRemaining - dt);
             $('#opponent-clock').text(formatSecondsToDigitalString(opponentTimeRemaining));
-            if (opponentTimeRemaining <= 0 && currentMode === 'solo') {
-                $('#opponent-clock').text("00:00").addClass('clock-flagged').removeClass('clock-running');
-                handleMatchCompletion('win', 'timeout');
+            if (opponentTimeRemaining <= 0) {
+                if (currentMode === 'solo') {
+                    $('#opponent-clock').text("00:00").addClass('clock-flagged').removeClass('clock-running');
+                    handleMatchCompletion('win', 'timeout');
+                } else {
+                    sendTimeoutClaimIfDue();
+                }
             }
         }
     }, 100);
@@ -1089,6 +1152,12 @@ botWorker.onmessage = function (e) {
         if (move) {
             const applied = game.move(move);
             if (applied) {
+                var format = $('#time-control-select').val();
+                var inc = timeControlIncrements[format] || 0;
+                if (inc > 0 && game.history().length >= 3) {
+                    opponentTimeRemaining += inc;
+                    repaintBothClocks();
+                }
                 clearSquareSelection();
                 highlightLastMove(applied.from, applied.to);
                 board.position(game.fen());
@@ -1142,6 +1211,7 @@ function saveGameState() {
         myAssignedColor,
         activeMatchId,
         userWalletAddress,
+        myGuestId,
         playerRatings,
         opponentRatings,
         timeControl: $('#time-control-select').val(),
@@ -1177,9 +1247,13 @@ function restoreGameState() {
         mySessionId = null;
         isAuthenticated = !isPaidMode;
 
+        if (state.timeControl && timeControlLimits[state.timeControl]) {
+            $('#time-control-select').val(state.timeControl);
+        }
         if (!userWalletAddress && state.userWalletAddress) {
             userWalletAddress = state.userWalletAddress.toLowerCase();
         }
+        if (state.myGuestId) myGuestId = state.myGuestId;
         if (state.opponentUsername) opponentUsername = state.opponentUsername;
         if (state.opponentWallet) opponentWallet = state.opponentWallet;
         if (state.opponentRatings) opponentRatings = state.opponentRatings;
@@ -1202,9 +1276,7 @@ function restoreGameState() {
         reapplyBoardHighlights();
         renderLiveMoveNotation();
         updateFloatingControls();
-
-        $('#user-clock').text(formatSecondsToDigitalString(userTimeRemaining));
-        $('#opponent-clock').text(formatSecondsToDigitalString(opponentTimeRemaining));
+        repaintBothClocks();
 
         establishP2PConnection(activeMatchId, true);
         return true;
@@ -1231,6 +1303,18 @@ function updateLifecycleButtons() {
     $('#btn-abort').prop('disabled', historyCount >= 2 || !isMatchActive || isSpectator || (isPaidMode && !isAuthenticated));
 }
 
+function closeP2PSocketCleanly() {
+    if (p2pReconnectTimer) {
+        clearTimeout(p2pReconnectTimer);
+        p2pReconnectTimer = null;
+    }
+    if (p2pSocket) {
+        p2pSocket._intentionalClose = true;
+        try { p2pSocket.close(); } catch (_) {}
+        p2pSocket = null;
+    }
+}
+
 // ============================================================================
 // 11. CHALLENGE LINKS (WITH CANCEL/REFUND & CLEAN URL RESTORATION) & SPECTATOR
 // ============================================================================
@@ -1252,6 +1336,7 @@ async function createChallengeLink() {
         return;
     }
     const tc = getTimeControlValue();
+    const tcName = $('#time-control-select').val() || 'blitz';
     const sidePref = 0; // On-chain createChallenge assigns creator to playerWhite
     const matchId = "0x" + Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2, '0')).join('');
 
@@ -1264,7 +1349,7 @@ async function createChallengeLink() {
     myAssignedColor = 'w';
 
     const base = window.location.origin + window.location.pathname;
-    const link = `${base}?challengeMatchId=${matchId}&tc=${tc}&stake=${stake || '0'}&paid=${isPaidMode}&sidePref=${sidePref}#${ephemeralPrivateKey}`;
+    const link = `${base}?challengeMatchId=${matchId}&tc=${tc}&tcName=${encodeURIComponent(tcName)}&stake=${stake || '0'}&paid=${isPaidMode}&sidePref=${sidePref}#${ephemeralPrivateKey}`;
 
     if (isPaidMode) {
         try {
@@ -1331,12 +1416,17 @@ function checkForChallengeLink() {
     const stake = normalizeStake(params.get('stake')) || '0.01';
     const parsedTc = parseInt(params.get('tc'), 10);
     const tcVal = isNaN(parsedTc) ? 1 : parsedTc;
+    const tcNameParam = params.get('tcName');
     const sidePref = parseInt(params.get('sidePref'), 10) || 0;
 
     $('#toggle-paid-mode').prop('checked', isPaidMode);
     $('#staking-ui-container').toggleClass('disabled-ui', !isPaidMode);
     $('#stake-amount-input').val(stake);
-    $('#time-control-select').val(tcVal === 0 ? "bullet" : (tcVal === 1 ? "blitz" : "rapid"));
+    if (tcNameParam && timeControlLimits[tcNameParam]) {
+        $('#time-control-select').val(tcNameParam);
+    } else {
+        $('#time-control-select').val(tcVal === 0 ? "bullet" : (tcVal === 1 ? "blitz" : "rapid"));
+    }
     $('#side-pref-container input[value="' + sidePref + '"]').prop('checked', true);
 
     const hashAnchor = window.location.hash;
@@ -1347,6 +1437,7 @@ function checkForChallengeLink() {
     $('#arena-app-wrapper').removeClass('hidden-element');
     $('#home-view-container').addClass('hidden-element');
     if (board === null) initChessboard();
+    resetClocksToSelectedFormat();
     updateFloatingControls();
 
     if (isPaidMode) {
@@ -1414,7 +1505,7 @@ function spectateMatchById(matchId) {
     reapplyBoardHighlights();
     updateFloatingControls();
 
-    if (p2pSocket && p2pSocket.readyState !== WebSocket.CLOSED) p2pSocket.close();
+    closeP2PSocketCleanly();
     p2pSocket = new WebSocket(WS_URL);
     p2pSocket._matchId = matchId;
     p2pSocket.onopen = function () {
@@ -1423,7 +1514,8 @@ function spectateMatchById(matchId) {
             matchId: matchId,
             spectate: true,
             username: myUsername,
-            wallet: userWalletAddress || null
+            wallet: userWalletAddress || null,
+            guestId: myGuestId
         }));
     };
     p2pSocket.onmessage = function (event) {
@@ -1443,7 +1535,6 @@ function enterSpectatorMode() {
     $('#analysis-moves-panel').removeClass('hidden-element');
     $('#live-action-controls, #post-game-controls').addClass('hidden-element');
 
-    // Enable isolated Spectator Lounge (Railbird Chat)
     $('#combat-chat-heading').text('👁️ Spectator Lounge (Railbird Chat)');
     $('#chat-text-input').attr('placeholder', "Railbird chat (players can't see)...");
     setChatEnabled(true);
@@ -1507,7 +1598,7 @@ async function fetchAndSetUsername() {
 function setupUsernameModalHandlers() {
     $('#btn-username-skip').click(function () {
         $('#username-modal').addClass('hidden-element');
-        myUsername = userWalletAddress ? ("Anon_" + userWalletAddress.slice(-4)) : "Player";
+        myUsername = userWalletAddress ? ("Anon_" + userWalletAddress.slice(-4)) : guestIdentity.guestName;
         updateProfileRatingsDisplay();
     });
 
@@ -1557,13 +1648,14 @@ async function autoReconnectWallet() {
             $('#btn-connect-wallet-landing').text(`❌ DISCONNECT (${truncated})`).addClass('btn-wallet-disconnect');
             $('#btn-connect-wallet-arena').text('Disconnect').addClass('btn-wallet-disconnect');
 
-            await fetchAndSetUsername();
-            await checkClaimablePayoutBalance();
-            setupGlobalMatchListener();
-
+            // Notify LitSocial immediately so zero-popup social auth runs without waiting for RPC calls
             if (window.LitSocial && typeof window.LitSocial.onWalletChanged === 'function') {
                 window.LitSocial.onWalletChanged(userWalletAddress);
             }
+
+            await fetchAndSetUsername();
+            await checkClaimablePayoutBalance();
+            setupGlobalMatchListener();
         }
     } catch (_) {}
 }
@@ -1618,13 +1710,13 @@ async function connectWeb3Wallet() {
         $('#btn-find-match').prop('disabled', false);
 
         showToast(`Connected & session key verified: ${truncated}`, "success");
-        await fetchAndSetUsername();
-        await checkClaimablePayoutBalance();
-        setupGlobalMatchListener();
-
         if (window.LitSocial && typeof window.LitSocial.onWalletChanged === 'function') {
             window.LitSocial.onWalletChanged(userWalletAddress);
         }
+
+        await fetchAndSetUsername();
+        await checkClaimablePayoutBalance();
+        setupGlobalMatchListener();
     } catch (err) {
         showToast("Wallet connection cancelled or failed.", "error");
     }
@@ -1636,7 +1728,7 @@ function disconnectWeb3Wallet() {
     web3Provider = null;
     chessContractInstance = null;
     authSignature = null;
-    myUsername = "Player";
+    myUsername = guestIdentity.guestName;
     updateProfileRatingsDisplay();
     $('#wallet-address').text('Not Connected');
     $('#btn-claim-payout').addClass('hidden-element');
@@ -1814,23 +1906,41 @@ async function initiateChainMatchmaking(stake, tcValue, sidePref) {
     }
 }
 
+function attachP2PAutoReconnect(sockRef) {
+    sockRef.onclose = function () {
+        if (sockRef._intentionalClose) return;
+        if (activeMatchId && isMatchActive && !gameResultSettled && !isReplayMode && !isSpectator) {
+            if (p2pReconnectTimer) clearTimeout(p2pReconnectTimer);
+            p2pReconnectTimer = setTimeout(() => {
+                p2pReconnectTimer = null;
+                if (activeMatchId && isMatchActive && !gameResultSettled) {
+                    establishP2PConnection(activeMatchId, true, true);
+                }
+            }, 1500);
+        }
+    };
+}
+
 function initiateFreeMatchmaking(overrideSidePref = null) {
     isPaidMode = false;
     isInQueue = true;
     const prefToUse = (overrideSidePref !== null && overrideSidePref !== undefined) ? overrideSidePref : getSidePreferenceValue();
+    const selectedTc = $('#time-control-select').val() || 'blitz';
     $('#btn-find-match').addClass('hidden-element');
     $('#btn-cancel-queue').removeClass('hidden-element').text("Cancel Queue");
     appendSystemMessage("🔍 Searching for an opponent in Free Mode pool...", false);
 
-    if (p2pSocket && p2pSocket.readyState !== WebSocket.CLOSED) p2pSocket.close();
+    closeP2PSocketCleanly();
     p2pSocket = new WebSocket(WS_URL);
+    attachP2PAutoReconnect(p2pSocket);
 
     p2pSocket.onopen = function () {
         p2pSocket.send(JSON.stringify({
             type: 'QUEUE_FREE_MATCH',
             wallet: userWalletAddress || null,
+            guestId: myGuestId,
             username: myUsername,
-            timeControl: $('#time-control-select').val(),
+            timeControl: selectedTc,
             sidePref: prefToUse
         }));
     };
@@ -1839,6 +1949,10 @@ function initiateFreeMatchmaking(overrideSidePref = null) {
         try {
             const data = JSON.parse(event.data);
             if (data.type === 'QUEUED_FREE_MATCH') {
+                if (!userWalletAddress && data.username) {
+                    myUsername = data.username;
+                    updateProfileRatingsDisplay();
+                }
                 showToast("Joined Free Match queue. Waiting for opponent...", "info", 2500);
                 return;
             }
@@ -1847,12 +1961,12 @@ function initiateFreeMatchmaking(overrideSidePref = null) {
                 myAssignedColor = data.color;
                 isMatchActive = true;
                 activeMatchId = data.matchId;
+                p2pSocket._matchId = activeMatchId;
                 isAuthenticated = true;
 
-                if (data.opponentName) {
-                    opponentUsername = data.opponentName;
-                    updateProfileRatingsDisplay();
-                }
+                if (!userWalletAddress && data.myName) myUsername = data.myName;
+                if (data.opponentName) opponentUsername = data.opponentName;
+                updateProfileRatingsDisplay();
 
                 $('#btn-cancel-queue').addClass('hidden-element');
                 $('#btn-find-match').removeClass('hidden-element').prop('disabled', true).text("Match in Progress");
@@ -1865,7 +1979,9 @@ function initiateFreeMatchmaking(overrideSidePref = null) {
                     matchId: activeMatchId,
                     color: myAssignedColor,
                     isPaidMode: false,
+                    timeControlName: data.timeControl || selectedTc,
                     wallet: userWalletAddress || null,
+                    guestId: myGuestId,
                     username: myUsername
                 }));
                 return;
@@ -1883,6 +1999,7 @@ function initiateFreeMatchmaking(overrideSidePref = null) {
 async function initiateTournamentJoin() {
     const rawId = $('#tourney-id-input').val().trim() || 'litforge-main-arena';
     const stake = normalizeStake($('#stake-amount-input').val() || 0.01) || '0.01';
+    const selectedTc = $('#time-control-select').val() || 'blitz';
 
     if (isPaidMode) {
         if (!userWalletAddress || !signer) {
@@ -1922,15 +2039,18 @@ async function initiateTournamentJoin() {
     const tourneyPayload = JSON.stringify({
         type: 'CREATE_OR_JOIN_TOURNEY',
         tourneyId: rawId,
-        wallet: userWalletAddress || ("guest_" + localClientId),
+        wallet: userWalletAddress || null,
+        guestId: myGuestId,
         username: myUsername,
         entryFee: stake,
-        timeControl: $('#time-control-select').val(),
+        timeControl: selectedTc,
         isPaid: isPaidMode
     });
 
     if (!p2pSocket || p2pSocket.readyState !== WebSocket.OPEN) {
+        closeP2PSocketCleanly();
         p2pSocket = new WebSocket(WS_URL);
+        attachP2PAutoReconnect(p2pSocket);
         p2pSocket.onopen = () => p2pSocket.send(tourneyPayload);
         p2pSocket.onmessage = (ev) => {
             const d = JSON.parse(ev.data);
@@ -1938,11 +2058,11 @@ async function initiateTournamentJoin() {
                 myAssignedColor = d.color;
                 isMatchActive = true;
                 activeMatchId = d.matchId;
+                p2pSocket._matchId = activeMatchId;
                 isAuthenticated = true;
-                if (d.opponentName) {
-                    opponentUsername = d.opponentName;
-                    updateProfileRatingsDisplay();
-                }
+                if (!userWalletAddress && d.myName) myUsername = d.myName;
+                if (d.opponentName) opponentUsername = d.opponentName;
+                updateProfileRatingsDisplay();
                 board.orientation(myAssignedColor === 'w' ? 'white' : 'black');
                 reapplyBoardHighlights();
                 p2pSocket.send(JSON.stringify({
@@ -1950,7 +2070,9 @@ async function initiateTournamentJoin() {
                     matchId: activeMatchId,
                     color: myAssignedColor,
                     isPaidMode: false,
+                    timeControlName: d.timeControl || selectedTc,
                     wallet: userWalletAddress || null,
+                    guestId: myGuestId,
                     username: myUsername
                 }));
             } else {
@@ -1973,11 +2095,10 @@ function establishP2PConnection(matchId, isRestored = false, forceReconnect = fa
         return;
     }
 
-    if (p2pSocket && p2pSocket.readyState !== WebSocket.CLOSED) {
-        p2pSocket.close();
-    }
+    closeP2PSocketCleanly();
     p2pSocket = new WebSocket(WS_URL);
     p2pSocket._matchId = matchId;
+    attachP2PAutoReconnect(p2pSocket);
 
     p2pSocket.onopen = function () {
         p2pSocket.send(JSON.stringify({
@@ -1986,12 +2107,14 @@ function establishP2PConnection(matchId, isRestored = false, forceReconnect = fa
             color: myAssignedColor,
             isPaidMode: isPaidMode,
             wallet: userWalletAddress || null,
+            guestId: myGuestId,
             timeControlVal: getTimeControlValue(),
+            timeControlName: $('#time-control-select').val() || 'blitz',
             username: myUsername
         }));
     };
     p2pSocket.onerror = function () {
-        showToast("WebSocket link interrupted. Click Reconnect if needed.", "warn");
+        showToast("WebSocket link interrupted. Reconnecting...", "warn");
     };
     p2pSocket.onmessage = function (event) {
         handleStandardP2PMessage(JSON.parse(event.data), isRestored);
@@ -2031,7 +2154,6 @@ function requestMatchAbort() {
 function handleStandardP2PMessage(data, isRestored = false) {
     if (!data || !data.type) return;
 
-    // Ignore social handshake banner on match sockets (handled exclusively by lobbySocket)
     if (data.type === 'SOCIAL_HELLO' || data.type === 'LOBBY_TELEMETRY') return;
 
     if (data.type === 'ERROR') {
@@ -2107,19 +2229,13 @@ function handleStandardP2PMessage(data, isRestored = false) {
 
     if (data.type === 'CLOCK_SYNC') {
         if (isMatchActive && !gameResultSettled) {
-            if (data.whiteTime !== undefined && data.blackTime !== undefined) {
-                const bottomIsWhite = isSpectator ? true : (myAssignedColor === 'w');
-                userTimeRemaining = bottomIsWhite ? data.whiteTime : data.blackTime;
-                opponentTimeRemaining = bottomIsWhite ? data.blackTime : data.whiteTime;
-                $('#user-clock').text(formatSecondsToDigitalString(userTimeRemaining));
-                $('#opponent-clock').text(formatSecondsToDigitalString(opponentTimeRemaining));
-            }
-            updateActiveClockGlow();
+            syncClocksFromServerPayload(data);
         }
         return;
     }
 
     if (data.type === 'TIME_OUT') {
+        syncClocksFromServerPayload(data);
         const flaggedColor = data.flaggedColor || (data.winnerColor === 'w' ? 'b' : (data.winnerColor === 'b' ? 'w' : null));
         const bottomColor = isSpectator ? 'w' : myAssignedColor;
         if (flaggedColor) {
@@ -2137,7 +2253,9 @@ function handleStandardP2PMessage(data, isRestored = false) {
                 appendSystemMessage(`⏱️ Flagged! ${data.winnerColor === 'w' ? 'White' : 'Black'} wins on time.`, false);
                 handleMatchCompletion('draw', 'timeout');
             } else {
-                handleMatchCompletion(data.winnerColor === myAssignedColor ? 'win' : 'loss', 'timeout');
+                const iWon = data.winnerColor === myAssignedColor;
+                appendSystemMessage(iWon ? "⏱️ Opponent ran out of time! You win!" : "⏱️ Your clock flagged! Time out.", !iWon);
+                handleMatchCompletion(iWon ? 'win' : 'loss', 'timeout');
             }
         } else {
             appendSystemMessage("🤝 Time out against insufficient mating material — Draw!", false);
@@ -2166,6 +2284,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
         case 'ROOM_JOINED':
             mySessionId = data.sessionId;
             if (data.color && !isSpectator) myAssignedColor = data.color;
+            if (!userWalletAddress && data.username && !isSpectator) myUsername = data.username;
             if (opponentDisconnectTimer) {
                 clearInterval(opponentDisconnectTimer);
                 opponentDisconnectTimer = null;
@@ -2183,6 +2302,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
             $('#match-settings-box').addClass('hidden-element');
             $('#analysis-moves-panel').removeClass('hidden-element');
             $('#live-action-controls').removeClass('hidden-element');
+            updateProfileRatingsDisplay();
             renderLiveMoveNotation();
             EventBus.emit('gameStart');
 
@@ -2253,13 +2373,11 @@ function handleStandardP2PMessage(data, isRestored = false) {
                     if (lm) highlightLastMove(lm.from, lm.to);
                 }
             }
-            if (data.whiteTime !== undefined && data.blackTime !== undefined) {
-                const bottomIsWhite = isSpectator ? true : (myAssignedColor === 'w');
-                userTimeRemaining = bottomIsWhite ? data.whiteTime : data.blackTime;
-                opponentTimeRemaining = bottomIsWhite ? data.blackTime : data.whiteTime;
-                $('#user-clock').text(formatSecondsToDigitalString(userTimeRemaining));
-                $('#opponent-clock').text(formatSecondsToDigitalString(opponentTimeRemaining));
+            if (data.timeControlName && timeControlLimits[data.timeControlName]) {
+                $('#time-control-select').val(data.timeControlName);
             }
+            syncClocksFromServerPayload(data);
+
             if (isSpectator) {
                 spectatorWhiteName = data.whiteUsername || 'White';
                 spectatorBlackName = data.blackUsername || 'Black';
@@ -2328,7 +2446,7 @@ function handleStandardP2PMessage(data, isRestored = false) {
 
         case 'RATINGS_UPDATED':
             if (data.ratings) {
-                const fmt = $('#time-control-select').val();
+                const fmt = getRatingBucket();
                 const oldRating = playerRatings[fmt] || 2000;
                 playerRatings = data.ratings;
                 const newRating = playerRatings[fmt] || 2000;
@@ -2398,11 +2516,10 @@ function handleStandardP2PMessage(data, isRestored = false) {
                     strengthenReconnection();
                     break;
                 }
-                if (data.whiteTime !== undefined && data.blackTime !== undefined) {
-                    const bottomIsWhite = isSpectator ? true : (myAssignedColor === 'w');
-                    userTimeRemaining = bottomIsWhite ? data.whiteTime : data.blackTime;
-                    opponentTimeRemaining = bottomIsWhite ? data.blackTime : data.whiteTime;
-                }
+
+                // Immediately sync & repaint BOTH clocks from authoritative server snapshot
+                syncClocksFromServerPayload(data);
+
                 clearSquareSelection();
                 highlightLastMove(data.from, data.to);
                 board.position(game.fen());
@@ -2470,10 +2587,6 @@ function executePremoves() {
 
     const move = game.move({ from: pm.from, to: pm.to, promotion: pm.promotion || 'q' });
     if (move) {
-        if (game.history().length >= 2) {
-            userTimeRemaining = Math.max(0, userTimeRemaining - 0.1);
-            $('#user-clock').text(formatSecondsToDigitalString(userTimeRemaining));
-        }
         clearSquareSelection();
         highlightLastMove(pm.from, pm.to);
         board.position(game.fen(), false);
@@ -2493,6 +2606,7 @@ function executePremoves() {
         if (move.flags && (move.flags.includes('k') || move.flags.includes('q'))) EventBus.emit('castle');
         if (move.promotion) EventBus.emit('promotion');
         if (game.history().length >= 2) clearTimeout(openingMoveTimer);
+        updateActiveClockGlow();
         updateLifecycleButtons();
         checkGameStatus();
         updateTurnStatusDisplay();
@@ -2565,10 +2679,11 @@ function initChessboard() {
 
         if (currentMode === 'solo') {
             var format = $('#time-control-select').val();
-            var inc = timeControlIncrements[format];
-            if (inc > 0 && game.history().length > 1) {
+            var inc = timeControlIncrements[format] || 0;
+            if (inc > 0 && game.history().length >= 3) {
                 if (activeTurnBeforeMove === myAssignedColor) userTimeRemaining += inc;
                 else opponentTimeRemaining += inc;
+                repaintBothClocks();
             }
         }
 
@@ -2699,7 +2814,6 @@ function initChessboard() {
             return;
         }
 
-        // If a piece is already selected, check if clicked square is a valid drop target
         if (selectedSquare && selectedSquare !== clickedSq) {
             const legalMoves = game.moves({ square: selectedSquare, verbose: true });
             if (legalMoves.some(m => m.to === clickedSq)) {
@@ -2721,7 +2835,6 @@ function initChessboard() {
             }
         }
 
-        // Otherwise, select or deselect player's own piece
         const sqPiece = game.get(clickedSq);
         if (sqPiece && sqPiece.color === myAssignedColor) {
             if (selectedSquare === clickedSq) clearSquareSelection();
@@ -2771,7 +2884,6 @@ function connectLobbyTelemetrySocket() {
             try {
                 const data = JSON.parse(ev.data);
 
-                // Route all social, presence, search, profile, DM, club & direct challenge messages to LitSocial
                 if (window.LitSocial && typeof window.LitSocial.handleMessage === 'function') {
                     if (window.LitSocial.handleMessage(data)) return;
                 }
@@ -2812,6 +2924,7 @@ window.LitChessBridge = {
     getContext() {
         return {
             wallet: userWalletAddress,
+            guestId: myGuestId,
             username: myUsername,
             signer,
             contract: chessContractInstance,
@@ -2947,11 +3060,18 @@ function sanitizeHTML(str) {
         .replace(/'/g, '\x26#39;');
 }
 
+function getRatingBucket(fmt) {
+    const f = String(fmt || $('#time-control-select').val() || 'blitz').toLowerCase();
+    if (f.startsWith('bullet')) return 'bullet';
+    if (f.startsWith('rapid')) return 'rapid';
+    return 'blitz';
+}
+
 function getTimeControlValue() {
     var val = $('#time-control-select').val();
     if (val === "bullet") return 0;
-    if (val === "blitz") return 1;
-    return 2;
+    if (val === "rapid") return 2;
+    return 1;
 }
 
 function getSidePreferenceValue() {
@@ -2971,7 +3091,7 @@ function updateQuickAddOpponentButton() {
 }
 
 function updateProfileRatingsDisplay() {
-    var activeFormat = $('#time-control-select').val();
+    var activeFormat = getRatingBucket();
     if (isReplayMode) {
         $('#user-name').text(replayWhiteName);
         $('#user-rating').text('(White)');
@@ -2997,7 +3117,7 @@ function updateProfileRatingsDisplay() {
 
 function resetClocksToSelectedFormat() {
     var format = $('#time-control-select').val();
-    var duration = timeControlLimits[format];
+    var duration = timeControlLimits[format] || 180;
     userTimeRemaining = duration;
     opponentTimeRemaining = duration;
     $('#user-clock').text(formatSecondsToDigitalString(userTimeRemaining)).removeClass('clock-running clock-flagged');
@@ -3018,6 +3138,7 @@ function clearAllTimers() {
     if (queuePollingInterval) clearInterval(queuePollingInterval);
     clearInterval(chessClockTicker);
     clearTimeout(openingMoveTimer);
+    if (p2pReconnectTimer) { clearTimeout(p2pReconnectTimer); p2pReconnectTimer = null; }
     if (abortFallbackTimer) { clearTimeout(abortFallbackTimer); abortFallbackTimer = null; }
     if (queueTimeout) { clearTimeout(queueTimeout); queueTimeout = null; }
     if (opponentDisconnectTimer) { clearInterval(opponentDisconnectTimer); opponentDisconnectTimer = null; }
@@ -3100,7 +3221,7 @@ function resetMatchEnvironment() {
     pendingChallengeInvite = null;
     createdChallengeMatchId = null;
 
-    if (p2pSocket) { p2pSocket.close(); p2pSocket = null; }
+    closeP2PSocketCleanly();
     game.reset();
     analysisGame.reset();
     if (board) { board.start(false); board.orientation('white'); }
@@ -3117,6 +3238,7 @@ function resetMatchEnvironment() {
     isSpectator = false;
     opponentWallet = null;
     opponentUsername = "Opponent";
+    lastTimeoutClaimAt = 0;
     setChatEnabled(false);
 
     $('#combat-chat-heading').text('💬 Combat Comms');
@@ -3369,6 +3491,7 @@ function startSoloMatch() {
     analysisGame.reset();
     board.start(false);
     clearMoveHighlights();
+    resetClocksToSelectedFormat();
     updateCapturedPiecesAndMaterial();
     renderLiveMoveNotation();
     $('#match-settings-box').addClass('hidden-element');
