@@ -82,7 +82,7 @@ var lastTimeoutClaimAt = 0;
 
 const STORAGE_KEY = 'litchess_game_state';
 const SESSION_DELEGATE_PREFIX = 'litchess_delegate_auth_';
-const CONTRACT_ADDRESS = "0xB04bAF7F9784491A7041b25Bc7d3191c46Cdf73e";
+const CONTRACT_ADDRESS = "0xb70B81A22cb63456c9f612B8F4d4082225F6afc4";
 const USERNAME_REGISTRY_ADDRESS = "0x7ff44d488B5e75adF4ba35B9fbAca68ce9BE92AE";
 const USERNAME_REGISTRY_ABI = [
     "function registerUsername(string _name) external",
@@ -649,6 +649,9 @@ let pairingTimeoutId = null;
 let globalMatchStartedListener = null;
 let queuePollingInterval = null;
 var pendingDrawOfferFromOpponent = false;
+var pendingTakebackOfferFromOpponent = false;
+var pendingTakebackSent = false;
+var contractSupportsExtendedTc = false;
 var isSpectator = false;
 var abortFallbackTimer = null;
 
@@ -1301,6 +1304,18 @@ function updateLifecycleButtons() {
     $('#btn-resign').prop('disabled', !canAct);
     $('#btn-draw').prop('disabled', !(canAct && currentMode !== 'solo'));
     $('#btn-abort').prop('disabled', historyCount >= 2 || !isMatchActive || isSpectator || (isPaidMode && !isAuthenticated));
+
+    const minPliesForTakeback = (game.turn() === myAssignedColor) ? 2 : 1;
+    let canTakeback = false;
+    if (currentMode === 'solo') {
+        canTakeback = !gameResultSettled && isMatchActive && !isBotThinking && historyCount >= minPliesForTakeback;
+    } else {
+        canTakeback = !gameResultSettled && isMatchActive && !isSpectator && (!isPaidMode || isAuthenticated) &&
+            !pendingTakebackSent && !pendingTakebackOfferFromOpponent && historyCount >= minPliesForTakeback;
+    }
+    $('#btn-takeback')
+        .prop('disabled', !canTakeback)
+        .text(pendingTakebackSent ? '⏳ Takeback Sent' : '↩️ Takeback');
 }
 
 function closeP2PSocketCleanly() {
@@ -1359,6 +1374,15 @@ async function createChallengeLink() {
             });
             showToast("Creating challenge on-chain...", "info");
             await tx.wait();
+            if (window.LitSocial && typeof window.LitSocial.registerPendingClaim === 'function') {
+                window.LitSocial.registerPendingClaim({
+                    matchId,
+                    amount: stake.toString(),
+                    label: 'Challenge Link',
+                    reason: `Unaccepted ${stake} zkLTC challenge link — refund anytime until joined.`,
+                    status: 'claimable'
+                });
+            }
             $('#challenge-link-text').text(link);
             $('#challenge-link-display').removeClass('hidden-element');
             establishP2PConnection(matchId, false);
@@ -1389,6 +1413,9 @@ async function cancelCreatedChallengeLink() {
             const tx = await chessContractInstance.cancelCreatedMatch(targetMatchId);
             showToast("Cancelling challenge & refunding stake on-chain...", "info");
             await tx.wait();
+            if (window.LitSocial && typeof window.LitSocial.clearPendingClaim === 'function') {
+                window.LitSocial.clearPendingClaim(targetMatchId);
+            }
             showToast("Challenge cancelled and stake refunded in full!", "success");
         } catch (err) {
             showToast("Cancel challenge failed: " + (err.reason || err.message), "error");
@@ -1425,7 +1452,8 @@ function checkForChallengeLink() {
     if (tcNameParam && timeControlLimits[tcNameParam]) {
         $('#time-control-select').val(tcNameParam);
     } else {
-        $('#time-control-select').val(tcVal === 0 ? "bullet" : (tcVal === 1 ? "blitz" : "rapid"));
+        const idxToName = { 0: 'bullet', 1: 'blitz', 2: 'rapid', 3: 'blitz3_2', 4: 'blitz5' };
+        $('#time-control-select').val(idxToName[tcVal] || 'blitz');
     }
     $('#side-pref-container input[value="' + sidePref + '"]').prop('checked', true);
 
@@ -1544,9 +1572,26 @@ function enterSpectatorMode() {
 // ============================================================================
 // 12. USERNAME REGISTRY, WALLET MANAGEMENT & PULL-PAYMENT PAYOUT CLAIM
 // ============================================================================
-async function checkClaimablePayoutBalance() {
+async function detectContractExtendedTimeControls(providerOrContract) {
+    if (!providerOrContract) return false;
+    try {
+        const escrow = providerOrContract.getPendingMatches
+            ? providerOrContract
+            : new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, providerOrContract);
+        await escrow.getPendingMatches(0, 3);
+        contractSupportsExtendedTc = true;
+    } catch (_) {
+        contractSupportsExtendedTc = false;
+    }
+    return contractSupportsExtendedTc;
+}
+
+async function checkClaimablePayoutBalance(silent = false) {
     if (!userWalletAddress || !chessContractInstance) {
         $('#btn-claim-payout').addClass('hidden-element');
+        if (window.LitSocial && typeof window.LitSocial.setEscrowClaimableBalance === 'function') {
+            window.LitSocial.setEscrowClaimableBalance(null);
+        }
         return;
     }
     try {
@@ -1554,9 +1599,17 @@ async function checkClaimablePayoutBalance() {
         if (claimableWei && claimableWei.gt(0)) {
             const formatted = parseFloat(ethers.utils.formatEther(claimableWei)).toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
             $('#btn-claim-payout').text(`💰 Claim ${formatted} zkLTC`).removeClass('hidden-element');
-            showToast(`You have ${formatted} zkLTC available to claim from escrow!`, "info");
+            if (window.LitSocial && typeof window.LitSocial.setEscrowClaimableBalance === 'function') {
+                window.LitSocial.setEscrowClaimableBalance(formatted);
+            }
+            if (!silent) {
+                showToast(`You have ${formatted} zkLTC available to claim from escrow!`, "info");
+            }
         } else {
             $('#btn-claim-payout').addClass('hidden-element');
+            if (window.LitSocial && typeof window.LitSocial.setEscrowClaimableBalance === 'function') {
+                window.LitSocial.setEscrowClaimableBalance(null);
+            }
         }
     } catch (_) {
         $('#btn-claim-payout').addClass('hidden-element');
@@ -1653,6 +1706,7 @@ async function autoReconnectWallet() {
                 window.LitSocial.onWalletChanged(userWalletAddress);
             }
 
+            await detectContractExtendedTimeControls(chessContractInstance);
             await fetchAndSetUsername();
             await checkClaimablePayoutBalance();
             setupGlobalMatchListener();
@@ -1714,6 +1768,7 @@ async function connectWeb3Wallet() {
             window.LitSocial.onWalletChanged(userWalletAddress);
         }
 
+        await detectContractExtendedTimeControls(chessContractInstance);
         await fetchAndSetUsername();
         await checkClaimablePayoutBalance();
         setupGlobalMatchListener();
@@ -1964,6 +2019,10 @@ function initiateFreeMatchmaking(overrideSidePref = null) {
                 p2pSocket._matchId = activeMatchId;
                 isAuthenticated = true;
 
+                if (data.timeControl && timeControlLimits[data.timeControl]) {
+                    $('#time-control-select').val(data.timeControl);
+                    resetClocksToSelectedFormat();
+                }
                 if (!userWalletAddress && data.myName) myUsername = data.myName;
                 if (data.opponentName) opponentUsername = data.opponentName;
                 updateProfileRatingsDisplay();
@@ -2060,6 +2119,10 @@ async function initiateTournamentJoin() {
                 activeMatchId = d.matchId;
                 p2pSocket._matchId = activeMatchId;
                 isAuthenticated = true;
+                if (d.timeControl && timeControlLimits[d.timeControl]) {
+                    $('#time-control-select').val(d.timeControl);
+                    resetClocksToSelectedFormat();
+                }
                 if (!userWalletAddress && d.myName) myUsername = d.myName;
                 if (d.opponentName) opponentUsername = d.opponentName;
                 updateProfileRatingsDisplay();
@@ -2280,6 +2343,82 @@ function handleStandardP2PMessage(data, isRestored = false) {
         return;
     }
 
+    if (data.type === 'TAKEBACK_SENT') {
+        pendingTakebackSent = true;
+        updateLifecycleButtons();
+        showToast(`Takeback request sent (undo ${data.pliesToUndo === 2 ? '2 moves' : '1 move'}).`, "info");
+        return;
+    }
+
+    if (data.type === 'TAKEBACK_OFFER' && data.fromClientId !== mySessionId) {
+        pendingTakebackOfferFromOpponent = true;
+        const moveWord = data.pliesToUndo === 2 ? '2 half-moves' : 'last move';
+        $('#takeback-offer-text').text(`↩️ ${data.fromName || 'Opponent'} requested a takeback (${moveWord})`);
+        $('#takeback-offer-prompt').removeClass('hidden-element');
+        appendSystemMessage(`↩️ ${data.fromName || 'Opponent'} requested a takeback.`, false);
+        updateLifecycleButtons();
+        EventBus.emit('notification');
+        return;
+    }
+
+    if (data.type === 'TAKEBACK_DECLINED') {
+        pendingTakebackSent = false;
+        pendingTakebackOfferFromOpponent = false;
+        $('#takeback-offer-prompt').addClass('hidden-element');
+        updateLifecycleButtons();
+        if (data.fromClientId !== mySessionId) {
+            showToast("Opponent declined your takeback request.", "warn");
+            appendSystemMessage("✖ Opponent declined takeback request.", false);
+        }
+        return;
+    }
+
+    if (data.type === 'TAKEBACK_CANCELLED') {
+        pendingTakebackSent = false;
+        pendingTakebackOfferFromOpponent = false;
+        $('#takeback-offer-prompt').addClass('hidden-element');
+        updateLifecycleButtons();
+        return;
+    }
+
+    if (data.type === 'TAKEBACK_ACCEPTED') {
+        pendingTakebackSent = false;
+        pendingTakebackOfferFromOpponent = false;
+        pendingDrawOfferFromOpponent = false;
+        $('#takeback-offer-prompt, #draw-offer-prompt').addClass('hidden-element');
+        clearPendingPremoves();
+        clearSquareSelection();
+
+        if (Array.isArray(data.moves)) {
+            game.reset();
+            for (const m of data.moves) {
+                game.move({ from: m.from, to: m.to, promotion: m.promotion || 'q' });
+            }
+            board.position(game.fen(), false);
+            if (data.moves.length > 0) {
+                const lm = game.history({ verbose: true }).pop();
+                if (lm) highlightLastMove(lm.from, lm.to);
+            } else {
+                clearMoveHighlights();
+            }
+        }
+
+        syncClocksFromServerPayload(data);
+        updateCheckHighlight();
+        updateCapturedPiecesAndMaterial();
+        renderLiveMoveNotation();
+        if (game.history().length < 2) startInitialAbortTimer();
+        else clearTimeout(openingMoveTimer);
+        runChessClockEngine();
+        updateLifecycleButtons();
+        updateTurnStatusDisplay();
+        saveGameState();
+        EventBus.emit('moveMade', { captured: false });
+        appendSystemMessage("↩️ Takeback accepted — position reverted.", false);
+        showToast("Takeback accepted!", "success");
+        return;
+    }
+
     switch (data.type) {
         case 'ROOM_JOINED':
             mySessionId = data.sessionId;
@@ -2399,6 +2538,12 @@ function handleStandardP2PMessage(data, isRestored = false) {
                     if (data.whiteRatings) opponentRatings = data.whiteRatings;
                 }
                 if (data.whiteWallet && data.blackWallet) {
+                    if (createdChallengeMatchId && window.LitSocial && typeof window.LitSocial.clearPendingClaim === 'function') {
+                        window.LitSocial.clearPendingClaim(createdChallengeMatchId);
+                    }
+                    if (activeMatchId && window.LitSocial && typeof window.LitSocial.clearPendingClaim === 'function') {
+                        window.LitSocial.clearPendingClaim(activeMatchId);
+                    }
                     createdChallengeMatchId = null;
                     $('#challenge-link-display').addClass('hidden-element');
                 }
@@ -2507,6 +2652,11 @@ function handleStandardP2PMessage(data, isRestored = false) {
                 if (pendingDrawOfferFromOpponent) {
                     pendingDrawOfferFromOpponent = false;
                     $('#draw-offer-prompt').addClass('hidden-element');
+                }
+                if (pendingTakebackOfferFromOpponent || pendingTakebackSent) {
+                    pendingTakebackOfferFromOpponent = false;
+                    pendingTakebackSent = false;
+                    $('#takeback-offer-prompt').addClass('hidden-element');
                 }
                 var targetPiece = game.get(data.to);
                 var captured = !!(targetPiece && targetPiece.color !== game.turn());
@@ -2696,6 +2846,11 @@ function initChessboard() {
             updateTurnStatusDisplay();
             if (!gameResultSettled) setTimeout(executeBotTurn, 220);
         } else {
+            if (pendingTakebackOfferFromOpponent || pendingTakebackSent) {
+                pendingTakebackOfferFromOpponent = false;
+                pendingTakebackSent = false;
+                $('#takeback-offer-prompt').addClass('hidden-element');
+            }
             if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
                 p2pSocket.send(JSON.stringify({
                     type: 'CHESS_MOVE',
@@ -2935,6 +3090,14 @@ window.LitChessBridge = {
         };
     },
 
+    async claimEscrowBalance() {
+        await claimFailedPayoutOnChain();
+    },
+
+    async refreshClaimableBalance(silent = true) {
+        await checkClaimablePayoutBalance(silent);
+    },
+
     launchDirectMatch(data) {
         if (!data || !data.matchId) return;
         if (isMatchActive && !gameResultSettled && !isSpectator) {
@@ -3067,11 +3230,18 @@ function getRatingBucket(fmt) {
     return 'blitz';
 }
 
-function getTimeControlValue() {
-    var val = $('#time-control-select').val();
+function getTimeControlValueForName(tcName) {
+    const val = String(tcName || 'blitz').toLowerCase();
     if (val === "bullet") return 0;
     if (val === "rapid") return 2;
+    if (val === "blitz3_2") return contractSupportsExtendedTc ? 3 : 1;
+    if (val === "blitz5") return contractSupportsExtendedTc ? 4 : 1;
     return 1;
+}
+window.getTimeControlValueForName = getTimeControlValueForName;
+
+function getTimeControlValue() {
+    return getTimeControlValueForName($('#time-control-select').val());
 }
 
 function getSidePreferenceValue() {
@@ -3196,6 +3366,9 @@ function handleMatchCompletion(result, reason = '') {
     clearAllTimers();
     clearPendingPremoves();
     clearSquareSelection();
+    pendingTakebackOfferFromOpponent = false;
+    pendingTakebackSent = false;
+    $('#takeback-offer-prompt, #draw-offer-prompt').addClass('hidden-element');
     if (!isSpectator) setChatEnabled(false);
     isMatchActive = false;
     $('.chess-clock').removeClass('clock-running');
@@ -3231,6 +3404,9 @@ function resetMatchEnvironment() {
     isAnalysisMode = false;
     isReplayMode = false;
     pendingDrawOffer = false;
+    pendingDrawOfferFromOpponent = false;
+    pendingTakebackOfferFromOpponent = false;
+    pendingTakebackSent = false;
     pendingRematchOffer = false;
     isInQueue = false;
     activeMatchId = null;
@@ -3247,7 +3423,9 @@ function resetMatchEnvironment() {
     $('#analysis-eval-gauge').addClass('hidden-eval');
     $('#analysis-controls, #analysis-moves-panel, #post-game-controls').addClass('hidden-element');
     $('#match-settings-box, #live-action-controls').removeClass('hidden-element');
+    $('#takeback-offer-prompt, #draw-offer-prompt').addClass('hidden-element');
     $('#btn-abort').prop('disabled', true).text("Abort Match");
+    $('#btn-takeback').prop('disabled', true).text("↩️ Takeback");
     $('#btn-resign, #btn-draw').prop('disabled', true);
     $('#game-phase').text("Status: Idle");
     $('#btn-view-analysis, #btn-rematch').removeClass('hidden-element');
@@ -3591,6 +3769,7 @@ $(document).ready(function () {
     setupUsernameModalHandlers();
     connectLobbyTelemetrySocket();
     setInterval(connectLobbyTelemetrySocket, 12000);
+    setInterval(() => { if (userWalletAddress) checkClaimablePayoutBalance(true); }, 45000);
 
     ['move', 'capture', 'check', 'castle', 'promotion', 'notification', 'gameStart', 'gameEnd'].forEach(s => {
         soundManager.loadSound(s, `sounds/${s}.mp3`);
@@ -3682,6 +3861,73 @@ $(document).ready(function () {
 
     $('#btn-abort').click(() => {
         requestMatchAbort();
+    });
+
+    $('#btn-takeback').click(() => {
+        if (gameResultSettled || !isMatchActive || isSpectator) return;
+
+        // Solo mode: immediate standard 2-ply (or 1-ply) undo against engine
+        if (currentMode === 'solo') {
+            if (isBotThinking) return;
+            const plies = (game.turn() === myAssignedColor) ? 2 : 1;
+            if (game.history().length < plies) {
+                showToast("No move to take back.", "warn");
+                return;
+            }
+            for (let i = 0; i < plies; i++) {
+                game.undo();
+            }
+            clearSquareSelection();
+            board.position(game.fen(), false);
+            const hist = game.history({ verbose: true });
+            if (hist.length > 0) {
+                const lm = hist[hist.length - 1];
+                highlightLastMove(lm.from, lm.to);
+            } else {
+                clearMoveHighlights();
+            }
+            updateCheckHighlight();
+            updateCapturedPiecesAndMaterial();
+            renderLiveMoveNotation();
+            updateLifecycleButtons();
+            updateTurnStatusDisplay();
+            EventBus.emit('moveMade', { captured: false });
+            appendSystemMessage("↩️ Move taken back.", false);
+            showToast("Move taken back.", "info", 2000);
+            return;
+        }
+
+        // PvP mode: send takeback request to opponent
+        if (pendingTakebackSent || pendingTakebackOfferFromOpponent) return;
+        if (isPaidMode && !isAuthenticated) return;
+        const minPlies = (game.turn() === myAssignedColor) ? 2 : 1;
+        if (game.history().length < minPlies) {
+            showToast("No move available to take back yet.", "warn");
+            return;
+        }
+        if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
+            pendingTakebackSent = true;
+            updateLifecycleButtons();
+            p2pSocket.send(JSON.stringify({ type: 'TAKEBACK_OFFER', sessionId: mySessionId }));
+        }
+    });
+
+    $('#btn-accept-takeback').click(() => {
+        if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
+            p2pSocket.send(JSON.stringify({ type: 'TAKEBACK_RESPONSE', accepted: true, sessionId: mySessionId }));
+        }
+        $('#takeback-offer-prompt').addClass('hidden-element');
+        pendingTakebackOfferFromOpponent = false;
+        updateLifecycleButtons();
+    });
+
+    $('#btn-decline-takeback').click(() => {
+        if (p2pSocket && p2pSocket.readyState === WebSocket.OPEN) {
+            p2pSocket.send(JSON.stringify({ type: 'TAKEBACK_RESPONSE', accepted: false, sessionId: mySessionId }));
+        }
+        $('#takeback-offer-prompt').addClass('hidden-element');
+        pendingTakebackOfferFromOpponent = false;
+        updateLifecycleButtons();
     });
     $('#btn-resign').click(() => {
         if (!gameResultSettled && game.history().length >= 2 && isMatchActive) {

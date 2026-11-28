@@ -23,6 +23,8 @@
         dmThreads: [],
         unreadDmTotal: 0,
         incomingChallenges: [],
+        pendingClaims: [],
+        escrowClaimableEth: null,
         myClub: null,
         clubsList: [],
         activityFeed: [],
@@ -40,6 +42,174 @@
     };
 
     const AWAY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes idle -> Away
+    const CLAIMS_STORAGE_PREFIX = 'litchess_pending_claims_';
+
+    function getLocalClaimsKey(wallet) {
+        return wallet ? (CLAIMS_STORAGE_PREFIX + String(wallet).toLowerCase()) : null;
+    }
+
+    function loadLocalClaims(wallet) {
+        const key = getLocalClaimsKey(wallet);
+        if (!key) return [];
+        try {
+            const raw = localStorage.getItem(key);
+            const arr = raw ? JSON.parse(raw) : [];
+            return Array.isArray(arr) ? arr : [];
+        } catch (_) {
+            return [];
+        }
+    }
+
+    function saveLocalClaims(wallet, claims) {
+        const key = getLocalClaimsKey(wallet);
+        if (!key) return;
+        try {
+            localStorage.setItem(key, JSON.stringify(claims || []));
+        } catch (_) {}
+    }
+
+    function mergeClaims(wallet, serverClaims) {
+        const local = loadLocalClaims(wallet);
+        const byMatch = new Map();
+        for (const c of local) {
+            if (c && c.matchId) byMatch.set(String(c.matchId).toLowerCase(), c);
+        }
+        for (const c of (serverClaims || [])) {
+            if (c && c.matchId) {
+                const k = String(c.matchId).toLowerCase();
+                const prev = byMatch.get(k);
+                byMatch.set(k, {
+                    ...(prev || {}),
+                    ...c,
+                    matchId: k,
+                    // Never downgrade an already-claimable item back to waiting_invite unless server confirms live invite
+                    status: c.status || (prev && prev.status) || 'claimable'
+                });
+            }
+        }
+        const merged = [...byMatch.values()].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        saveLocalClaims(wallet, merged);
+        state.pendingClaims = merged;
+        return merged;
+    }
+
+    function getVisibleClaimableItems() {
+        const items = [];
+        if (state.escrowClaimableEth && Number(state.escrowClaimableEth) > 0) {
+            items.push({
+                kind: 'escrow_payout',
+                matchId: null,
+                amount: state.escrowClaimableEth,
+                label: 'Escrow Payout Balance',
+                reason: 'Claimable zkLTC waiting in LitVM Escrow contract.',
+                status: 'claimable'
+            });
+        }
+        for (const c of (state.pendingClaims || [])) {
+            // Show claimable items (and any waiting_invite older than 2.5 min whose timer expired offline)
+            const expiredOffline = c.status === 'waiting_invite' && c.createdAt && (Date.now() - c.createdAt > 130000);
+            if (c.status === 'claimable' || expiredOffline) {
+                items.push({ ...c, status: 'claimable' });
+            }
+        }
+        return items;
+    }
+
+    function registerPendingClaimLocalAndServer(claimObj) {
+        const ctx = getBridge().getContext ? getBridge().getContext() : {};
+        const wallet = (state.authedWallet || ctx.wallet || '').toLowerCase();
+        if (!wallet || !claimObj || !claimObj.matchId) return;
+        const cleanId = String(claimObj.matchId).toLowerCase();
+        const item = {
+            kind: claimObj.kind || 'challenge_refund',
+            matchId: cleanId,
+            amount: String(claimObj.amount || '0'),
+            label: String(claimObj.label || 'Staked Challenge'),
+            reason: String(claimObj.reason || 'Refundable staked match'),
+            status: claimObj.status || 'claimable',
+            createdAt: claimObj.createdAt || Date.now()
+        };
+        const existing = loadLocalClaims(wallet).filter(c => String(c.matchId).toLowerCase() !== cleanId);
+        existing.unshift(item);
+        saveLocalClaims(wallet, existing);
+        state.pendingClaims = existing;
+
+        sendSocial({
+            type: 'CLAIM_REGISTER',
+            kind: item.kind,
+            matchId: item.matchId,
+            amount: item.amount,
+            label: item.label,
+            reason: item.reason,
+            status: item.status
+        });
+        updateNotificationBadges();
+        renderArenaClaimsDrawer();
+    }
+
+    function clearPendingClaimLocalAndServer(matchId) {
+        if (!matchId) return;
+        const ctx = getBridge().getContext ? getBridge().getContext() : {};
+        const wallet = (state.authedWallet || ctx.wallet || '').toLowerCase();
+        const cleanId = String(matchId).toLowerCase();
+        if (wallet) {
+            const filtered = loadLocalClaims(wallet).filter(c => String(c.matchId).toLowerCase() !== cleanId);
+            saveLocalClaims(wallet, filtered);
+            state.pendingClaims = filtered;
+        } else {
+            state.pendingClaims = state.pendingClaims.filter(c => String(c.matchId).toLowerCase() !== cleanId);
+        }
+        sendSocial({ type: 'CLAIM_REMOVE', matchId: cleanId });
+        updateNotificationBadges();
+        renderArenaClaimsDrawer();
+    }
+
+    async function verifyPendingClaimsOnChain() {
+        const ctx = getBridge().getContext ? getBridge().getContext() : {};
+        const wallet = (ctx.wallet || state.authedWallet || '').toLowerCase();
+        if (!wallet || !ctx.contract) return;
+
+        // Re-sync local claims into state even before/without WS
+        mergeClaims(wallet, state.pendingClaims);
+        const list = [...state.pendingClaims];
+        let changed = false;
+
+        for (const item of list) {
+            if (!item || !item.matchId || item.kind !== 'challenge_refund') continue;
+            try {
+                const m = await ctx.contract.matches(item.matchId);
+                const statusNum = Number(m.status);
+                const white = String(m.playerWhite || '').toLowerCase();
+                const black = String(m.playerBlack || '').toLowerCase();
+                const wagerWei = m.wagerAmount;
+                const isStillRefundable = statusNum === 0 && white === wallet && black === ethers.constants.AddressZero && wagerWei && wagerWei.gt(0);
+
+                if (!isStillRefundable) {
+                    clearPendingClaimLocalAndServer(item.matchId);
+                    changed = true;
+                } else {
+                    const exactEth = parseFloat(ethers.utils.formatEther(wagerWei)).toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+                    if (exactEth && item.amount !== exactEth) {
+                        item.amount = exactEth;
+                        changed = true;
+                    }
+                    // If this is NOT currently an active live outgoing banner, mark it claimable immediately!
+                    const isLiveOutgoing = state.activeOutgoingChallenge &&
+                        String(state.activeOutgoingChallenge.matchId || '').toLowerCase() === item.matchId;
+                    if (!isLiveOutgoing && item.status !== 'claimable') {
+                        item.status = 'claimable';
+                        changed = true;
+                    }
+                }
+            } catch (_) {}
+        }
+
+        if (changed) {
+            saveLocalClaims(wallet, state.pendingClaims);
+        }
+        updateNotificationBadges();
+        renderArenaClaimsDrawer();
+    }
 
     // =========================================================================
     // 1. HELPERS (Copy-paste-safe HTML escaping & Time Control formatting)
@@ -244,16 +414,61 @@
     // =========================================================================
     // 3. BADGES & NOTIFICATION BELL
     // =========================================================================
+    function buildClaimCardHtml(item) {
+        if (item.kind === 'escrow_payout') {
+            return `
+                <div class="claim-notif-card">
+                    <div class="claim-notif-top">
+                        <span class="claim-notif-title">💰 ${esc(item.label)}</span>
+                        <span class="claim-notif-amount">${esc(item.amount)} zkLTC</span>
+                    </div>
+                    <div class="claim-notif-sub">${esc(item.reason)}</div>
+                    <div class="claim-notif-actions">
+                        <button type="button" class="btn-claim-now" data-claim-escrow-balance="1">Claim ${esc(item.amount)} zkLTC</button>
+                    </div>
+                </div>`;
+        }
+        return `
+            <div class="claim-notif-card">
+                <div class="claim-notif-top">
+                    <span class="claim-notif-title">💰 ${esc(item.label)}</span>
+                    <span class="claim-notif-amount">${esc(item.amount)} zkLTC</span>
+                </div>
+                <div class="claim-notif-sub">${esc(item.reason)}</div>
+                <div class="claim-notif-actions">
+                    <button type="button" class="btn-claim-now" data-claim-refund-match="${esc(item.matchId)}">Refund ${esc(item.amount)} zkLTC</button>
+                </div>
+            </div>`;
+    }
+
+    function renderArenaClaimsDrawer() {
+        const items = getVisibleClaimableItems();
+        const wrap = $('#arena-claims-wrapper');
+        const drawer = $('#arena-claims-drawer');
+        $('#badge-claims-count').text(items.length);
+
+        if (items.length === 0) {
+            wrap.addClass('hidden-element');
+            drawer.addClass('hidden-element').empty();
+            return;
+        }
+
+        wrap.removeClass('hidden-element');
+        drawer.html(items.map(buildClaimCardHtml).join(''));
+    }
+
     function updateNotificationBadges() {
         const reqCount = state.incomingRequests.length;
         const dmCount = state.unreadDmTotal || 0;
         const chCount = state.activeIncomingChallenge ? 1 : 0;
-        const total = reqCount + dmCount + chCount;
+        const claimCount = getVisibleClaimableItems().length;
+        const total = reqCount + dmCount + chCount + claimCount;
 
         $('#badge-tab-requests').text(reqCount).toggleClass('hidden-element', reqCount === 0);
         $('#badge-tab-dms').text(dmCount).toggleClass('hidden-element', dmCount === 0);
         $('#social-bell-badge-home').text(total).toggleClass('hidden-element', total === 0);
 
+        renderArenaClaimsDrawer();
         renderHomePopover();
     }
 
@@ -262,13 +477,25 @@
         if (box.hasClass('hidden-element')) return;
         box.empty();
 
-        if (!state.authedWallet) {
-            box.html('<div class="popover-title">Social Hub</div><div class="social-empty-state">Connect your wallet to see friend requests, DMs, and live invites.</div>');
+        const ctx = getBridge().getContext ? getBridge().getContext() : {};
+        const connectedWallet = state.authedWallet || ctx.wallet;
+        if (!connectedWallet) {
+            box.html('<div class="popover-title">Notifications &amp; Claims</div><div class="social-empty-state">Connect your wallet to see claimable stakes, friend requests, and DMs.</div>');
             return;
         }
 
         let html = '<div class="popover-title">Live Notifications</div>';
         let hasItems = false;
+
+        const claimItems = getVisibleClaimableItems();
+        if (claimItems.length > 0) {
+            hasItems = true;
+            html += '<div class="popover-claims-section">';
+            claimItems.forEach(item => {
+                html += buildClaimCardHtml(item);
+            });
+            html += '</div>';
+        }
 
         if (state.incomingRequests.length > 0) {
             hasItems = true;
@@ -857,7 +1084,9 @@
             return;
         }
 
-        const tcVal = timeControl === 'bullet' ? 0 : (timeControl === 'rapid' ? 2 : 1);
+        const tcVal = typeof window.getTimeControlValueForName === 'function'
+            ? window.getTimeControlValueForName(timeControl)
+            : (timeControl === 'bullet' ? 0 : (timeControl === 'rapid' ? 2 : 1));
         const matchId = '0x' + Array.from(crypto.getRandomValues(new Uint8Array(32)))
             .map(b => b.toString(16).padStart(2, '0')).join('');
         const ephemeralWallet = ethers.Wallet.createRandom();
@@ -872,6 +1101,16 @@
             });
             notifyToast('Escrowing wager on LitVM...', 'info');
             await tx.wait();
+
+            // Immediately persist locally & on server so refreshing/disconnecting NEVER loses this stake
+            registerPendingClaimLocalAndServer({
+                kind: 'challenge_refund',
+                matchId,
+                amount: stake.toString(),
+                label: `Challenge to ${state.dcTarget.username}`,
+                reason: `Escrowed ${stake} zkLTC challenge to ${state.dcTarget.username}.`,
+                status: 'waiting_invite'
+            });
 
             sendSocial({
                 type: 'DIRECT_CHALLENGE_SEND',
@@ -945,17 +1184,18 @@
         });
     }
 
-    function renderRefundPromptBanner(matchId, reasonText) {
+    function renderRefundPromptBanner(matchId, reasonText, stakeAmount = null) {
+        const amtLabel = stakeAmount ? ` (${esc(stakeAmount)} zkLTC)` : '';
         $('#outgoing-challenge-banner').removeClass('hidden-element').html(`
             <div class="challenge-banner-row">
                 <div>
-                    <div class="challenge-banner-title">💰 Refund Available</div>
-                    <div class="challenge-banner-sub">${esc(reasonText)}</div>
+                    <div class="challenge-banner-title">💰 Refund Available${amtLabel}</div>
+                    <div class="challenge-banner-sub">${esc(reasonText)} Saved to your Notifications until claimed.</div>
                 </div>
             </div>
             <div class="challenge-banner-actions">
                 <button id="btn-dc-refund-now" data-refund-match="${esc(matchId)}" class="btn-cta-launch">Refund Escrowed zkLTC</button>
-                <button id="btn-dc-refund-dismiss" class="btn-secondary">Dismiss</button>
+                <button id="btn-dc-refund-dismiss" class="btn-secondary">Save for Later</button>
             </div>
         `);
     }
@@ -1016,18 +1256,30 @@
         }
     }
 
-    async function refundStakedChallenge(matchId) {
+    async function refundStakedChallenge(matchId, btnEl = null) {
         const ctx = getBridge().getContext ? getBridge().getContext() : {};
-        if (!ctx.contract || !matchId) return;
+        if (!ctx.contract || !matchId) {
+            notifyToast('Connect your wallet to claim this refund.', 'warn');
+            return;
+        }
+        const $btn = btnEl ? $(btnEl) : null;
+        const origText = $btn ? $btn.text() : '';
         try {
+            if ($btn) $btn.prop('disabled', true).text('Refunding...');
             notifyToast('Refunding escrowed stake on-chain...', 'info');
             const tx = await ctx.contract.cancelCreatedMatch(matchId);
             await tx.wait();
+            clearPendingClaimLocalAndServer(matchId);
             notifyToast('Full zkLTC stake refunded to your wallet!', 'success');
             $('#outgoing-challenge-banner').addClass('hidden-element').empty();
             state.activeOutgoingChallenge = null;
+            if (getBridge().refreshClaimableBalance) getBridge().refreshClaimableBalance(true);
         } catch (err) {
+            // Re-verify on-chain in case it was already refunded or accepted in another tab
+            await verifyPendingClaimsOnChain();
             notifyToast('Refund failed: ' + (err.reason || err.message), 'error');
+        } finally {
+            if ($btn) $btn.prop('disabled', false).text(origText);
         }
     }
 
@@ -1093,6 +1345,10 @@
                 state.unreadDmTotal = data.unreadDmTotal || 0;
                 state.myClub = data.myClub || null;
                 state.activityFeed = data.activityFeed || [];
+                if (state.authedWallet) {
+                    mergeClaims(state.authedWallet, data.pendingClaims || []);
+                    setTimeout(() => verifyPendingClaimsOnChain(), 400);
+                }
 
                 if (state.me && state.me.privacy) {
                     $('#privacy-challenges-select').val(state.me.privacy.challenges || 'everyone');
@@ -1170,6 +1426,9 @@
                 $('#incoming-challenge-banner, #outgoing-challenge-banner').addClass('hidden-element').empty();
                 state.activeIncomingChallenge = null;
                 state.activeOutgoingChallenge = null;
+                if (data.isPaid && data.matchId) {
+                    clearPendingClaimLocalAndServer(data.matchId);
+                }
                 updateNotificationBadges();
                 if (getBridge().launchDirectMatch) {
                     getBridge().launchDirectMatch(data);
@@ -1180,7 +1439,16 @@
                 if (state.challengeCountdownTimer) clearInterval(state.challengeCountdownTimer);
                 state.activeOutgoingChallenge = null;
                 if (data.isPaid && data.matchId) {
-                    renderRefundPromptBanner(data.matchId, `${data.toName} declined your staked challenge.`);
+                    playNotifSound();
+                    registerPendingClaimLocalAndServer({
+                        kind: 'challenge_refund',
+                        matchId: data.matchId,
+                        amount: data.stake || '0',
+                        label: `Challenge to ${data.toName}`,
+                        reason: `${data.toName} declined your staked challenge.`,
+                        status: 'claimable'
+                    });
+                    renderRefundPromptBanner(data.matchId, `${data.toName} declined your staked challenge.`, data.stake);
                 } else {
                     $('#outgoing-challenge-banner').addClass('hidden-element').empty();
                     notifyToast(`${data.toName} declined your challenge.`, 'warn');
@@ -1197,11 +1465,30 @@
                 if (state.activeOutgoingChallenge && state.activeOutgoingChallenge.challengeId === data.challengeId) {
                     state.activeOutgoingChallenge = null;
                     if (data.isPaid && data.matchId) {
-                        renderRefundPromptBanner(data.matchId, `Challenge to ${data.toName} expired.`);
+                        playNotifSound();
+                        registerPendingClaimLocalAndServer({
+                            kind: 'challenge_refund',
+                            matchId: data.matchId,
+                            amount: data.stake || '0',
+                            label: `Challenge to ${data.toName}`,
+                            reason: `Challenge to ${data.toName} expired.`,
+                            status: 'claimable'
+                        });
+                        renderRefundPromptBanner(data.matchId, `Challenge to ${data.toName} expired.`, data.stake);
                     } else {
                         $('#outgoing-challenge-banner').addClass('hidden-element').empty();
                         notifyToast('Direct challenge expired.', 'info');
                     }
+                } else if (data.isPaid && data.matchId && data.toName) {
+                    // Handles expiry even if outgoing banner was already dismissed or page refreshed
+                    registerPendingClaimLocalAndServer({
+                        kind: 'challenge_refund',
+                        matchId: data.matchId,
+                        amount: data.stake || '0',
+                        label: `Challenge to ${data.toName}`,
+                        reason: `Challenge to ${data.toName} expired.`,
+                        status: 'claimable'
+                    });
                 }
                 return true;
 
@@ -1515,10 +1802,34 @@
         });
 
         $(document).on('click', '#btn-dc-refund-now', function () {
-            refundStakedChallenge($(this).data('refund-match'));
+            refundStakedChallenge($(this).data('refund-match'), this);
         });
         $(document).on('click', '#btn-dc-refund-dismiss', () => {
             $('#outgoing-challenge-banner').addClass('hidden-element').empty();
+            notifyToast('Refund saved in your Notifications (🔔 / 💰 Unclaimed Stakes) until claimed.', 'info', 4000);
+        });
+
+        $('#btn-toggle-claims-drawer').click(() => {
+            const drawer = $('#arena-claims-drawer');
+            drawer.toggleClass('hidden-element');
+            $('#claims-drawer-chevron').text(drawer.hasClass('hidden-element') ? '▾' : '▴');
+        });
+
+        $(document).on('click', '[data-claim-refund-match]', function () {
+            refundStakedChallenge($(this).data('claim-refund-match'), this);
+        });
+
+        $(document).on('click', '[data-claim-escrow-balance]', async function () {
+            if (getBridge().claimEscrowBalance) {
+                const $b = $(this);
+                const orig = $b.text();
+                $b.prop('disabled', true).text('Claiming...');
+                try {
+                    await getBridge().claimEscrowBalance();
+                } finally {
+                    $b.prop('disabled', false).text(orig);
+                }
+            }
         });
 
         $('#btn-open-create-club').click(() => {
@@ -1594,6 +1905,8 @@
                 state.blocked = [];
                 state.dmThreads = [];
                 state.unreadDmTotal = 0;
+                state.pendingClaims = [];
+                state.escrowClaimableEth = null;
                 state.myClub = null;
                 renderFriendsAndFollowing();
                 renderRequestsAndBlocked();
@@ -1602,8 +1915,19 @@
                 updateNotificationBadges();
                 return;
             }
+            // Load locally cached claims immediately and verify them on-chain
+            mergeClaims(wallet, []);
+            updateNotificationBadges();
+            setTimeout(() => verifyPendingClaimsOnChain(), 600);
             attemptSocialAuth();
         },
+        registerPendingClaim: registerPendingClaimLocalAndServer,
+        clearPendingClaim: clearPendingClaimLocalAndServer,
+        setEscrowClaimableBalance(formattedEth) {
+            state.escrowClaimableEth = formattedEth || null;
+            updateNotificationBadges();
+        },
+        verifyPendingClaimsOnChain,
         onUsernameRegistered() {
             // Reopen the lobby socket cleanly so the server sends a fresh SOCIAL_HELLO nonce
             // and re-reads the newly claimed on-chain handle from UsernameRegistry.

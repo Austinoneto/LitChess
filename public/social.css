@@ -830,3 +830,110 @@
     .prof-ratings-grid { grid-template-columns: repeat(2, 1fr); }
     .home-social-popover { width: 270px; right: -40px; }
 }
+
+/* --- Persistent Claimable Stakes & Refunds Notification Bar & Drawer --- */
+.claims-notif-wrapper {
+    margin: 8px 0 2px 0;
+}
+
+.claims-notif-bar {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(245, 158, 11, 0.16));
+    border: 1.5px solid #10b981;
+    color: #ecfdf5;
+    padding: 7px 10px;
+    border-radius: 7px;
+    font-size: 11.5px;
+    font-weight: 800;
+    cursor: pointer;
+    box-shadow: 0 0 14px rgba(16, 185, 129, 0.2);
+}
+
+.claims-notif-bar:hover {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.3), rgba(245, 158, 11, 0.22));
+    border-color: #34d399;
+}
+
+.claims-bar-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.claims-notif-drawer {
+    margin-top: 5px;
+    background: #0b0d13;
+    border: 1px solid #10b981;
+    border-radius: 7px;
+    padding: 7px;
+    max-height: 210px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.claim-notif-card {
+    background: #131824;
+    border: 1px solid #26314a;
+    border-left: 3px solid #10b981;
+    border-radius: 6px;
+    padding: 7px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.claim-notif-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+}
+
+.claim-notif-title {
+    font-size: 11.5px;
+    font-weight: 800;
+    color: #34d399;
+}
+
+.claim-notif-amount {
+    font-family: monospace;
+    font-size: 11px;
+    font-weight: 800;
+    color: #fef08a;
+}
+
+.claim-notif-sub {
+    font-size: 10.5px;
+    color: #94a3b8;
+    line-height: 1.3;
+}
+
+.claim-notif-actions {
+    display: flex;
+    gap: 5px;
+}
+
+.btn-claim-now {
+    flex: 1;
+    background: linear-gradient(135deg, #00e676, #10b981);
+    color: #05160e;
+    font-size: 11px;
+    font-weight: 800;
+    padding: 5px 8px;
+    border-radius: 5px;
+}
+
+.btn-claim-now:hover {
+    background: linear-gradient(135deg, #34d399, #059669);
+}
+
+.popover-claims-section {
+    border-bottom: 1px solid #282e42;
+    padding-bottom: 8px;
+    margin-bottom: 8px;
+}

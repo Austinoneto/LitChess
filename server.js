@@ -81,7 +81,7 @@ try {
 // 1. BLOCKCHAIN & ORACLE CONFIGURATION
 // =====================================================================
 const RPC_URL = (process.env.RPC_URL || "https://rpc.testnet.liteforge.zeeve.net").trim();
-const CONTRACT_ADDRESS = ethers.getAddress((process.env.CONTRACT_ADDRESS || "0xB04bAF7F9784491A7041b25Bc7d3191c46Cdf73e").trim());
+const CONTRACT_ADDRESS = ethers.getAddress((process.env.CONTRACT_ADDRESS || "0xb70B81A22cb63456c9f612B8F4d4082225F6afc4").trim());
 const USERNAME_REGISTRY_ADDRESS = ethers.getAddress((process.env.USERNAME_REGISTRY_ADDRESS || "0x7ff44d488B5e75adF4ba35B9fbAca68ce9BE92AE").trim());
 
 const provider = new ethers.JsonRpcProvider(RPC_URL);
@@ -366,9 +366,24 @@ function getTimeControlFromIndex(index) {
     const byIndex = {
         0: tcMap.bullet,
         1: tcMap.blitz,
-        2: tcMap.rapid
+        2: tcMap.rapid,
+        3: tcMap.blitz3_2,
+        4: tcMap.blitz5
     };
     return byIndex[Number(index)] || tcMap.blitz;
+}
+
+const paidMatchTcHints = new Map();
+function registerMatchTcHint(matchId, tcName) {
+    if (!matchId || !tcName) return;
+    const cfg = tcMap[String(tcName).toLowerCase()];
+    if (!cfg) return;
+    const cleanId = ensureBytes32(matchId).toLowerCase();
+    paidMatchTcHints.set(cleanId, cfg.name);
+    if (paidMatchTcHints.size > 4000) {
+        const firstKey = paidMatchTcHints.keys().next().value;
+        if (firstKey) paidMatchTcHints.delete(firstKey);
+    }
 }
 
 async function fetchUsername(address) {
@@ -681,6 +696,9 @@ function createRoomInstance(matchId, overrides = {}) {
         openingTimerStart: null,
         nonces: new Map(),
         drawOfferFrom: null,
+        takebackOffer: null,
+        moveIncHistory: [],
+        requestedTimeControlName: null,
         timeControlName: 'blitz',
         gameEnded: false,
         createdAt: Date.now(),
@@ -698,6 +716,7 @@ const social = createSocialServer({
     sendSafe,
     RESTRICTED_WORDS,
     storage: externalStorage,
+    registerMatchTcHint,
     createDirectFreeRoom: ({ whiteWallet, blackWallet, timeControl }) => {
         evictCompletedRoomsIfNeeded();
         const tcCfg = getTimeControlConfig(timeControl);
@@ -966,7 +985,15 @@ async function verifyPaidRoomOnChain(room, matchId, maxAttempts = 5) {
                 const matchData = await escrowContract.matches(cleanMatchId);
                 const whiteWallet = (matchData.playerWhite || "").toLowerCase();
                 const blackWallet = (matchData.playerBlack || "").toLowerCase();
-                const tcConfig = getTimeControlFromIndex(matchData.timeControl);
+                const chainTcIdx = Number(matchData.timeControl);
+                let tcConfig = getTimeControlFromIndex(chainTcIdx);
+
+                // If on-chain contract uses legacy 3-enum Blitz (1), preserve any explicit
+                // blitz sub-variant (blitz3_2 or blitz5) hinted by challenge/client before move 1.
+                const hintedTc = paidMatchTcHints.get(cleanMatchId.toLowerCase()) || room.requestedTimeControlName || room.timeControlName;
+                if (chainTcIdx === 1 && (hintedTc === 'blitz3_2' || hintedTc === 'blitz5')) {
+                    tcConfig = getTimeControlConfig(hintedTc);
+                }
 
                 if (matchData.wagerAmount) {
                     room.wagerEth = Number(ethers.formatEther(matchData.wagerAmount));
@@ -1042,6 +1069,7 @@ function abortRoomAndRefund(room, matchId, reason = 'opening_timeout') {
     if (!room || room.gameEnded) return;
     room.gameEnded = true;
     room.turnStartedAt = null;
+    room.takebackOffer = null;
     console.log(`[ORACLE] Aborting match ${matchId} (reason: ${reason}, isPaidMode: ${room.isPaidMode})`);
 
     if (room.isPaidMode && !room.txPending) {
@@ -1059,6 +1087,7 @@ function finalizeGameEnd(room, matchId, winnerColor, reason) {
     if (!room || room.gameEnded) return;
     room.gameEnded = true;
     room.turnStartedAt = null;
+    room.takebackOffer = null;
 
     let winnerWallet = ethers.ZeroAddress;
     if (winnerColor === 'w') winnerWallet = room.whiteWallet || ethers.ZeroAddress;
@@ -1708,9 +1737,15 @@ server.on('connection', (ws, req) => {
                     return;
                 }
 
+                if (isPaid && reqTcName && tcMap[String(reqTcName).toLowerCase()]) {
+                    registerMatchTcHint(matchId, reqTcName);
+                }
+
                 let room = rooms.get(matchId);
                 if (!room) {
-                    const tcInfo = reqTcName ? getTimeControlConfig(reqTcName) : getTimeControlFromIndex(timeControlVal ?? 1);
+                    const cleanKey = ensureBytes32(matchId).toLowerCase();
+                    const effectiveTcName = reqTcName || paidMatchTcHints.get(cleanKey) || null;
+                    const tcInfo = effectiveTcName ? getTimeControlConfig(effectiveTcName) : getTimeControlFromIndex(timeControlVal ?? 1);
                     room = createRoomInstance(matchId, {
                         isPaidMode: !!isPaid,
                         isFreeMode: !isPaid,
@@ -1720,12 +1755,26 @@ server.on('connection', (ws, req) => {
                         blackTimeMs: tcInfo.time * 1000,
                         inc: tcInfo.inc,
                         incMs: tcInfo.inc * 1000,
+                        requestedTimeControlName: effectiveTcName ? tcInfo.name : null,
                         timeControlName: tcInfo.name
                     });
                     rooms.set(matchId, room);
-                } else if (isPaid && !room.isPaidMode) {
-                    room.isPaidMode = true;
-                    room.isFreeMode = false;
+                } else {
+                    if (isPaid && !room.isPaidMode) {
+                        room.isPaidMode = true;
+                        room.isFreeMode = false;
+                    }
+                    if (room.chess.history().length === 0 && (reqTcName === 'blitz3_2' || reqTcName === 'blitz5')) {
+                        const tcInfo = getTimeControlConfig(reqTcName);
+                        room.requestedTimeControlName = tcInfo.name;
+                        room.timeControlName = tcInfo.name;
+                        room.whiteTime = tcInfo.time;
+                        room.blackTime = tcInfo.time;
+                        room.whiteTimeMs = tcInfo.time * 1000;
+                        room.blackTimeMs = tcInfo.time * 1000;
+                        room.inc = tcInfo.inc;
+                        room.incMs = tcInfo.inc * 1000;
+                    }
                 }
 
                 room.clients.add(ws);
@@ -1812,6 +1861,9 @@ server.on('connection', (ws, req) => {
                             room.players.set(ws.sessionId, existingPlayer);
                             room.spectators.delete(ws.sessionId);
                             if (room.drawOfferFrom === sid) room.drawOfferFrom = ws.sessionId;
+                            if (room.takebackOffer && room.takebackOffer.fromSessionId === sid) {
+                                room.takebackOffer.fromSessionId = ws.sessionId;
+                            }
                             broadcastToRoom(matchId, { type: 'OPPONENT_RECONNECTED' }, ws);
                             break;
                         }
@@ -2015,6 +2067,9 @@ server.on('connection', (ws, req) => {
                             room.players.set(ws.sessionId, player);
                             room.spectators.delete(ws.sessionId);
                             if (room.drawOfferFrom === sid) room.drawOfferFrom = ws.sessionId;
+                            if (room.takebackOffer && room.takebackOffer.fromSessionId === sid) {
+                                room.takebackOffer.fromSessionId = ws.sessionId;
+                            }
                             wasReconnect = true;
                         }
                     }
@@ -2179,7 +2234,12 @@ server.on('connection', (ws, req) => {
                 }
 
                 room.drawOfferFrom = null;
+                if (room.takebackOffer) {
+                    room.takebackOffer = null;
+                    broadcastToRoom(currentMatchId, { type: 'TAKEBACK_CANCELLED', reason: 'move_played' });
+                }
                 const plyAfterMove = room.chess.history().length;
+                let incAddedThisMove = 0;
 
                 // 3. Symmetrical Lichess/Chess.com Clock Transitions:
                 // - Ply 1 (White move 1): clocks still paused; reset opening abort timer for Black
@@ -2193,6 +2253,7 @@ server.on('connection', (ws, req) => {
                     room.turnStartedAt = now;
                 } else {
                     if (room.incMs > 0) {
+                        incAddedThisMove = room.incMs;
                         if (player.color === 'w') {
                             room.whiteTimeMs += room.incMs;
                             room.whiteTime = msToSeconds(room.whiteTimeMs);
@@ -2203,6 +2264,7 @@ server.on('connection', (ws, req) => {
                     }
                     room.turnStartedAt = now;
                 }
+                room.moveIncHistory.push({ color: player.color, incAddedMs: incAddedThisMove });
 
                 room.lastSyncBroadcastAt = now;
                 const clocksActive = plyAfterMove >= 2 && !chessIsGameOver(room.chess);
@@ -2313,6 +2375,136 @@ server.on('connection', (ws, req) => {
                     }
                     room.drawOfferFrom = null;
                 }
+                return;
+            }
+
+            // ---------- TAKEBACK REQUEST & RESPONSE (STANDARD CHESS TAKEBACK) ----------
+            if (type === 'TAKEBACK_OFFER') {
+                if (!currentMatchId) return;
+                const room = rooms.get(currentMatchId);
+                if (!room || room.gameEnded || chessIsGameOver(room.chess)) return;
+                const player = room.players.get(ws.sessionId);
+                if (!player || (room.isPaidMode && !player.authenticated)) {
+                    sendSafe(ws, { type: 'ERROR', reason: 'Not authenticated.' });
+                    return;
+                }
+
+                const historyLen = room.chess.history().length;
+                // Standard Lichess/Chess.com rule:
+                // - If it is opponent's turn (requester just moved), undo 1 ply (returns turn to requester).
+                // - If it is requester's turn (opponent already replied), undo 2 plies (returns turn to requester).
+                const pliesToUndo = (room.chess.turn() !== player.color) ? 1 : 2;
+                if (historyLen < pliesToUndo) {
+                    sendSafe(ws, { type: 'ERROR', reason: 'No move available to take back.' });
+                    return;
+                }
+
+                if (room.takebackOffer) {
+                    if (room.takebackOffer.fromSessionId === ws.sessionId) {
+                        sendSafe(ws, { type: 'ERROR', reason: 'Takeback request already pending.' });
+                        return;
+                    }
+                }
+
+                room.takebackOffer = {
+                    fromSessionId: ws.sessionId,
+                    fromColor: player.color,
+                    pliesToUndo,
+                    plyCountAtOffer: historyLen
+                };
+
+                broadcastToRoom(currentMatchId, {
+                    type: 'TAKEBACK_OFFER',
+                    fromClientId: ws.sessionId,
+                    fromColor: player.color,
+                    fromName: player.username || 'Opponent',
+                    pliesToUndo
+                }, ws);
+
+                sendSafe(ws, {
+                    type: 'TAKEBACK_SENT',
+                    pliesToUndo
+                });
+                return;
+            }
+
+            if (type === 'TAKEBACK_RESPONSE') {
+                if (!currentMatchId) return;
+                const room = rooms.get(currentMatchId);
+                if (!room || room.gameEnded || chessIsGameOver(room.chess)) return;
+                const responder = room.players.get(ws.sessionId);
+                if (!responder || (room.isPaidMode && !responder.authenticated)) return;
+
+                const offer = room.takebackOffer;
+                if (!offer || offer.fromSessionId === ws.sessionId) return;
+
+                room.takebackOffer = null;
+
+                if (!message.accepted) {
+                    broadcastToRoom(currentMatchId, {
+                        type: 'TAKEBACK_DECLINED',
+                        fromClientId: ws.sessionId
+                    });
+                    return;
+                }
+
+                if (room.chess.history().length !== offer.plyCountAtOffer) {
+                    broadcastToRoom(currentMatchId, {
+                        type: 'TAKEBACK_CANCELLED',
+                        reason: 'board_changed'
+                    });
+                    return;
+                }
+
+                const now = Date.now();
+                const { whiteMs, blackMs } = getLiveClocksMs(room, now);
+                room.whiteTimeMs = whiteMs;
+                room.blackTimeMs = blackMs;
+
+                let actuallyUndone = 0;
+                for (let i = 0; i < offer.pliesToUndo; i++) {
+                    const undone = room.chess.undo();
+                    if (!undone) break;
+                    actuallyUndone++;
+                    // Reverse any increment granted on the undone ply to prevent time farming
+                    const incRec = room.moveIncHistory.pop();
+                    if (incRec && incRec.incAddedMs > 0) {
+                        if (incRec.color === 'w') {
+                            room.whiteTimeMs = Math.max(1000, room.whiteTimeMs - incRec.incAddedMs);
+                        } else {
+                            room.blackTimeMs = Math.max(1000, room.blackTimeMs - incRec.incAddedMs);
+                        }
+                    }
+                }
+
+                room.whiteTime = msToSeconds(room.whiteTimeMs);
+                room.blackTime = msToSeconds(room.blackTimeMs);
+                room.drawOfferFrom = null;
+
+                const plyAfter = room.chess.history().length;
+                if (plyAfter >= 2) {
+                    room.turnStartedAt = now;
+                    room.openingTimerStart = null;
+                } else {
+                    room.turnStartedAt = null;
+                    room.openingTimerStart = now;
+                }
+                room.lastSyncBroadcastAt = now;
+
+                const verboseHistory = room.chess.history({ verbose: true });
+                broadcastToRoom(currentMatchId, {
+                    type: 'TAKEBACK_ACCEPTED',
+                    fen: room.chess.fen(),
+                    moves: verboseHistory.map(m => ({ from: m.from, to: m.to, promotion: m.promotion || 'q', san: m.san })),
+                    turn: room.chess.turn(),
+                    whiteTime: room.whiteTime,
+                    blackTime: room.blackTime,
+                    clocksActive: plyAfter >= 2,
+                    inc: room.inc || 0,
+                    serverNow: now,
+                    undonePlies: actuallyUndone,
+                    requestedByColor: offer.fromColor
+                });
                 return;
             }
 
@@ -2433,7 +2625,9 @@ server.on('close', () => clearInterval(heartbeatInterval));
 (async function bootServer() {
     await initExternalStorage();
     await loadRatings();
-    if (typeof social.loadDb === 'function') {
+    if (typeof social.init === 'function') {
+        await social.init();
+    } else if (typeof social.loadDb === 'function') {
         await social.loadDb();
     }
 

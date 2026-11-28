@@ -24,7 +24,8 @@ function createEmptyDb() {
         matches: [],        // { matchId, white, black, whiteName, blackName, winner, winnerColor, reason, timeControl, isPaid, wagerEth, pgn, moveCount, timestamp }
         clubs: {},          // clubId -> { id, name, tag, description, owner, members: [], messages: [], createdAt }
         activityFeed: [],   // { id, actor, actorName, actorClubTag, kind, text, matchId, clubId, createdAt }
-        reports: []         // { id, reporter, target, reason, createdAt }
+        reports: [],        // { id, reporter, target, reason, createdAt }
+        pendingClaims: []   // { id, wallet, kind, matchId, amount, label, reason, status, createdAt }
     };
 }
 
@@ -39,7 +40,8 @@ function createSocialServer(deps) {
         fetchUsername,
         sendSafe,
         RESTRICTED_WORDS = [],
-        createDirectFreeRoom
+        createDirectFreeRoom,
+        registerMatchTcHint
     } = deps;
 
     // =========================================================================
@@ -60,7 +62,8 @@ function createSocialServer(deps) {
                 matches: Array.isArray(parsed?.matches) ? parsed.matches : [],
                 clubs: (parsed && parsed.clubs) || {},
                 activityFeed: Array.isArray(parsed?.activityFeed) ? parsed.activityFeed : [],
-                reports: Array.isArray(parsed?.reports) ? parsed.reports : []
+                reports: Array.isArray(parsed?.reports) ? parsed.reports : [],
+                pendingClaims: Array.isArray(parsed?.pendingClaims) ? parsed.pendingClaims : []
             };
             for (const [w, u] of Object.entries(db.users)) {
                 if (u && u.username && !String(u.username).includes('...')) {
@@ -76,6 +79,69 @@ function createSocialServer(deps) {
 
     function saveDb() {
         return storage.saveJSON('social_db', SOCIAL_DB_FILE, db);
+    }
+
+    function upsertPendingClaim(wallet, claimData) {
+        const w = normalizeWallet(wallet);
+        if (!w || !claimData || !claimData.matchId) return null;
+        const cleanMatchId = String(claimData.matchId).toLowerCase();
+        let existing = db.pendingClaims.find(c => c.wallet === w && String(c.matchId).toLowerCase() === cleanMatchId);
+        if (existing) {
+            if (claimData.amount !== undefined) existing.amount = String(claimData.amount);
+            if (claimData.label) existing.label = String(claimData.label).slice(0, 80);
+            if (claimData.reason) existing.reason = String(claimData.reason).slice(0, 160);
+            if (claimData.status) existing.status = claimData.status;
+            existing.updatedAt = Date.now();
+        } else {
+            existing = {
+                id: crypto.randomBytes(8).toString('hex'),
+                wallet: w,
+                kind: claimData.kind || 'challenge_refund',
+                matchId: cleanMatchId,
+                amount: String(claimData.amount || '0'),
+                label: String(claimData.label || 'Staked Challenge').slice(0, 80),
+                reason: String(claimData.reason || 'Refundable staked match').slice(0, 160),
+                status: claimData.status || 'claimable',
+                createdAt: Date.now(),
+                updatedAt: Date.now()
+            };
+            db.pendingClaims.unshift(existing);
+            if (db.pendingClaims.length > 500) db.pendingClaims.length = 500;
+        }
+        saveDb();
+        return existing;
+    }
+
+    function removePendingClaim(wallet, matchId) {
+        const w = normalizeWallet(wallet);
+        if (!w || !matchId) return false;
+        const cleanMatchId = String(matchId).toLowerCase();
+        const before = db.pendingClaims.length;
+        db.pendingClaims = db.pendingClaims.filter(c => !(c.wallet === w && String(c.matchId).toLowerCase() === cleanMatchId));
+        if (db.pendingClaims.length !== before) {
+            saveDb();
+            return true;
+        }
+        return false;
+    }
+
+    function getPendingClaimsForWallet(wallet) {
+        const w = normalizeWallet(wallet);
+        if (!w) return [];
+        const activeOutgoingIds = new Set();
+        const now = Date.now();
+        for (const ch of directChallenges.values()) {
+            if (ch.fromWallet === w && ch.isPaid && ch.matchId && ch.expiresAt > now) {
+                activeOutgoingIds.add(String(ch.matchId).toLowerCase());
+            }
+        }
+        // Any paid challenge still in pendingClaims that is NOT currently an active live invite is ready to claim/refund
+        return db.pendingClaims
+            .filter(c => c.wallet === w)
+            .map(c => ({
+                ...c,
+                status: activeOutgoingIds.has(String(c.matchId).toLowerCase()) ? 'waiting_invite' : 'claimable'
+            }));
     }
 
     // =========================================================================
@@ -432,6 +498,7 @@ function createSocialServer(deps) {
             dmThreads,
             unreadDmTotal: unread.total,
             incomingChallenges,
+            pendingClaims: getPendingClaimsForWallet(w),
             myClub,
             activityFeed: getFilteredActivityFeed(w)
         };
@@ -776,12 +843,25 @@ function createSocialServer(deps) {
         if (ch.timeoutHandle) clearTimeout(ch.timeoutHandle);
         directChallenges.delete(challengeId);
 
+        if (ch.isPaid && ch.matchId) {
+            upsertPendingClaim(ch.fromWallet, {
+                kind: 'challenge_refund',
+                matchId: ch.matchId,
+                amount: ch.stake,
+                label: `Challenge to ${ch.toName}`,
+                reason: `Challenge to ${ch.toName} expired — claim your full refund.`,
+                status: 'claimable'
+            });
+            pushSyncToWallet(ch.fromWallet);
+        }
+
         sendToWallet(ch.fromWallet, {
             type: 'DIRECT_CHALLENGE_EXPIRED',
             challengeId,
             toWallet: ch.toWallet,
             toName: ch.toName,
             isPaid: ch.isPaid,
+            stake: ch.stake,
             matchId: ch.matchId || null
         });
         sendToWallet(ch.toWallet, {
@@ -1091,7 +1171,9 @@ function createSocialServer(deps) {
             'CLUB_CREATE',
             'CLUB_JOIN',
             'CLUB_LEAVE',
-            'CLUB_CHAT_SEND'
+            'CLUB_CHAT_SEND',
+            'CLAIM_REGISTER',
+            'CLAIM_REMOVE'
         ]);
 
         if (!AUTH_ONLY_TYPES.has(type)) {
@@ -1108,6 +1190,30 @@ function createSocialServer(deps) {
         // ---------- FRIENDS SYNC REQUEST ----------
         if (type === 'FRIENDS_SYNC_REQUEST') {
             sendSafe(ws, buildFriendsSyncPayload(me));
+            return true;
+        }
+
+        // ---------- PERSISTENT CLAIMABLE STAKES / REFUNDS ----------
+        if (type === 'CLAIM_REGISTER') {
+            const matchId = String(message.matchId || '').trim();
+            if (!/^0x[0-9a-fA-F]{64}$/.test(matchId)) return true;
+            upsertPendingClaim(me, {
+                kind: message.kind || 'challenge_refund',
+                matchId,
+                amount: message.amount || '0',
+                label: message.label || 'Staked Challenge',
+                reason: message.reason || 'Unaccepted staked challenge — refund available.',
+                status: message.status || 'claimable'
+            });
+            pushSyncToWallet(me);
+            return true;
+        }
+
+        if (type === 'CLAIM_REMOVE') {
+            const matchId = String(message.matchId || '').trim();
+            if (matchId && removePendingClaim(me, matchId)) {
+                pushSyncToWallet(me);
+            }
             return true;
         }
 
@@ -1377,7 +1483,8 @@ function createSocialServer(deps) {
                 return true;
             }
 
-            const timeControl = ['bullet', 'blitz', 'rapid'].includes(message.timeControl) ? message.timeControl : 'blitz';
+            const VALID_TCS = ['bullet', 'blitz', 'blitz3_2', 'blitz5', 'rapid'];
+            const timeControl = VALID_TCS.includes(message.timeControl) ? message.timeControl : 'blitz';
             const sidePref = [0, 1, 2].includes(Number(message.sidePref)) ? Number(message.sidePref) : 2;
             const isPaid = !!message.isPaid;
             const stake = isPaid ? String(message.stake || '0.01') : '0';
@@ -1387,6 +1494,20 @@ function createSocialServer(deps) {
             if (isPaid && (!/^0x[0-9a-fA-F]{64}$/.test(matchId) || !ephemeralPrivateKey)) {
                 sendSafe(ws, { type: 'SOCIAL_ERROR', reason: 'Invalid staked challenge parameters.' });
                 return true;
+            }
+
+            if (isPaid && matchId) {
+                if (typeof registerMatchTcHint === 'function') {
+                    registerMatchTcHint(matchId, timeControl);
+                }
+                upsertPendingClaim(me, {
+                    kind: 'challenge_refund',
+                    matchId,
+                    amount: stake,
+                    label: `Challenge to ${getDisplayName(target)}`,
+                    reason: `Escrowed ${stake} zkLTC challenge to ${getDisplayName(target)}.`,
+                    status: 'waiting_invite'
+                });
             }
 
             for (const [cid, existing] of directChallenges.entries()) {
@@ -1465,12 +1586,24 @@ function createSocialServer(deps) {
             directChallenges.delete(challengeId);
 
             if (!accepted) {
+                if (ch.isPaid && ch.matchId) {
+                    upsertPendingClaim(ch.fromWallet, {
+                        kind: 'challenge_refund',
+                        matchId: ch.matchId,
+                        amount: ch.stake,
+                        label: `Challenge to ${getDisplayName(me)}`,
+                        reason: `${getDisplayName(me)} declined your staked challenge.`,
+                        status: 'claimable'
+                    });
+                    pushSyncToWallet(ch.fromWallet);
+                }
                 sendToWallet(ch.fromWallet, {
                     type: 'DIRECT_CHALLENGE_DECLINED',
                     challengeId,
                     toWallet: me,
                     toName: getDisplayName(me),
                     isPaid: ch.isPaid,
+                    stake: ch.stake,
                     matchId: ch.matchId || null
                 });
                 sendSafe(ws, { type: 'SOCIAL_INFO', message: `Declined challenge from ${ch.fromName}.` });
@@ -1478,6 +1611,13 @@ function createSocialServer(deps) {
             }
 
             if (ch.isPaid) {
+                if (ch.matchId) {
+                    if (typeof registerMatchTcHint === 'function') {
+                        registerMatchTcHint(ch.matchId, ch.timeControl);
+                    }
+                    removePendingClaim(ch.fromWallet, ch.matchId);
+                    pushSyncToWallet(ch.fromWallet);
+                }
                 sendToWallet(ch.fromWallet, {
                     type: 'DIRECT_CHALLENGE_ACCEPTED',
                     challengeId,
@@ -1547,6 +1687,17 @@ function createSocialServer(deps) {
             if (!ch || ch.fromWallet !== me) return true;
             if (ch.timeoutHandle) clearTimeout(ch.timeoutHandle);
             directChallenges.delete(challengeId);
+            if (ch.isPaid && ch.matchId) {
+                upsertPendingClaim(me, {
+                    kind: 'challenge_refund',
+                    matchId: ch.matchId,
+                    amount: ch.stake,
+                    label: `Challenge to ${ch.toName}`,
+                    reason: 'Cancelled staked challenge — claim your on-chain refund.',
+                    status: 'claimable'
+                });
+                pushSyncToWallet(me);
+            }
             sendToWallet(ch.toWallet, {
                 type: 'DIRECT_CHALLENGE_EXPIRED',
                 challengeId,
